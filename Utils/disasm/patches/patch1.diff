@@ -1,0 +1,136 @@
+diff --git a/src/diagnostics/objects-printer.cc b/src/diagnostics/objects-printer.cc
+index 2ec89d58962..41dc89e6bee 100644
+--- a/src/diagnostics/objects-printer.cc
++++ b/src/diagnostics/objects-printer.cc
+@@ -1629,7 +1629,6 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+   os << "\n - data: " << Brief(function_data(kAcquireLoad));
+   os << "\n - code (from data): ";
+   os << Brief(GetCode());
+-  PrintSourceCode(os);
+   // Script files are often large, thus only print their {Brief} representation.
+   os << "\n - script: " << Brief(script());
+   os << "\n - function token position: " << function_token_position();
+@@ -1652,6 +1651,10 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+     os << "<none>";
+   }
+   os << "\n";
++  os << "\nStart BytecodeArray\n";
++  this->GetActiveBytecodeArray().Disassemble(os);
++  os << "\nEnd BytecodeArray\n";
++  os << std::flush;
+ }
+ 
+ void JSGlobalProxy::JSGlobalProxyPrint(std::ostream& os) {
+diff --git a/src/objects/objects.cc b/src/objects/objects.cc
+index d16146114e8..500b47942b3 100644
+--- a/src/objects/objects.cc
++++ b/src/objects/objects.cc
+@@ -1860,6 +1860,16 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+     os << accumulator.ToCString().get();
+     return;
+   }
++
++  // Print array literal members instead of only "<AsmWasmData>"
++  if (map(cage_base).instance_type() == ASM_WASM_DATA_TYPE) {
++    os << "<ArrayBoilerplateDescription> ";
++    ArrayBoilerplateDescription::cast(*this)
++        .constant_elements()
++        .HeapObjectShortPrint(os);
++    return;
++  }
++
+   switch (map(cage_base).instance_type()) {
+     case MAP_TYPE: {
+       os << "<Map";
+@@ -1942,14 +1952,24 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+       break;
+     case FIXED_ARRAY_TYPE:
+       os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
++      os << "\nStart FixedArray\n";
++      FixedArray::cast(*this).FixedArrayPrint(os);
++      os << "\nEnd FixedArray\n";
+       break;
+     case OBJECT_BOILERPLATE_DESCRIPTION_TYPE:
+       os << "<ObjectBoilerplateDescription[" << FixedArray::cast(*this).length()
+          << "]>";
++      os << "\nStart ObjectBoilerplateDescription\n";
++      ObjectBoilerplateDescription::cast(*this)
++          .ObjectBoilerplateDescriptionPrint(os);
++      os << "\nEnd ObjectBoilerplateDescription\n";
+       break;
+     case FIXED_DOUBLE_ARRAY_TYPE:
+       os << "<FixedDoubleArray[" << FixedDoubleArray::cast(*this).length()
+          << "]>";
++      os << "\nStart FixedDoubleArray\n";
++      FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
++      os << "\nEnd FixedDoubleArray\n";
+       break;
+     case BYTE_ARRAY_TYPE:
+       os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
+@@ -2028,6 +2048,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+       } else {
+         os << "<SharedFunctionInfo>";
+       }
++      os << "\nStart SharedFunctionInfo\n";
++      shared.SharedFunctionInfoPrint(os);
++      os << "\nEnd SharedFunctionInfo\n";
+       break;
+     }
+     case JS_MESSAGE_OBJECT_TYPE:
+diff --git a/src/objects/string.cc b/src/objects/string.cc
+index 1670a8114ca..d5e64056d42 100644
+--- a/src/objects/string.cc
++++ b/src/objects/string.cc
+@@ -602,13 +602,6 @@ void String::StringShortPrint(StringStream* accumulator) {
+   accumulator->Add("<String[%u]: ", len);
+   accumulator->Add(PrefixForDebugPrint());
+ 
+-  if (len > kMaxShortPrintLength) {
+-    accumulator->Add("...<truncated>>");
+-    accumulator->Add(SuffixForDebugPrint());
+-    accumulator->Put('>');
+-    return;
+-  }
+-
+   PrintUC16(accumulator, 0, len);
+   accumulator->Add(SuffixForDebugPrint());
+   accumulator->Put('>');
+diff --git a/src/snapshot/code-serializer.cc b/src/snapshot/code-serializer.cc
+index 618cf9e975e..a023e42a8f3 100644
+--- a/src/snapshot/code-serializer.cc
++++ b/src/snapshot/code-serializer.cc
+@@ -456,6 +456,11 @@ MaybeHandle<SharedFunctionInfo> CodeSerializer::Deserialize(
+     return MaybeHandle<SharedFunctionInfo>();
+   }
+ 
++  std::cout << "\nStart SharedFunctionInfo\n";
++  result->SharedFunctionInfoPrint(std::cout);
++  std::cout << "\nEnd SharedFunctionInfo\n";
++  std::cout << std::flush;
++
+   if (FLAG_profile_deserialization) {
+     double ms = timer.Elapsed().InMillisecondsF();
+     int length = cached_data->length();
+@@ -609,9 +614,7 @@ SerializedCodeData::SerializedCodeData(const std::vector<byte>* payload,
+ 
+ SerializedCodeSanityCheckResult SerializedCodeData::SanityCheck(
+     uint32_t expected_source_hash) const {
+-  SerializedCodeSanityCheckResult result = SanityCheckWithoutSource();
+-  if (result != SerializedCodeSanityCheckResult::kSuccess) return result;
+-  return SanityCheckJustSource(expected_source_hash);
++  return SerializedCodeSanityCheckResult::kSuccess;
+ }
+ 
+ SerializedCodeSanityCheckResult SerializedCodeData::SanityCheckJustSource(
+diff --git a/src/snapshot/deserializer.cc b/src/snapshot/deserializer.cc
+index e1383ca2b7f..43034871fc1 100644
+--- a/src/snapshot/deserializer.cc
++++ b/src/snapshot/deserializer.cc
+@@ -258,7 +258,6 @@ Deserializer<IsolateT>::Deserializer(IsolateT* isolate,
+ #ifdef DEBUG
+   num_api_references_ = GetNumApiReferences(isolate);
+ #endif  // DEBUG
+-  CHECK_EQ(magic_number_, SerializedData::kMagicNumber);
+ }
+ 
+ template <typename IsolateT>
