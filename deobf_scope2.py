@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# JSC Deobfuscator - static deobfuscation of View8 pseudocode generated from
+# compiled V8 JavaScript bytecode.
+#
+# Copyright (C) 2026 Aleksandra "Hasherezade" Doniec @ Check Point Research
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
 ''' Replace variables with their literal values, including Scope array references.
 '''
 import argparse
