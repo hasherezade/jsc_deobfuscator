@@ -6,6 +6,8 @@ It operates on pseudocode produced by [View8](https://github.com/suleram/View8),
 
 The filters are pattern-driven and intended primarily as a research toolkit and reference implementation. The tool is **not** a general-purpose JavaScript deobfuscator, does not reconstruct the original source code, and does not produce runnable JavaScript. Its output remains View8 pseudocode intended for static inspection, searching, comparison, and function-tree export.
 
+📖 [Read Wiki](https://github.com/hasherezade/jsc_deobfuscator/wiki)
+
 ## Safety notes
 
 - View8 serialized files use Python `pickle`. Loading a malicious or untrusted `.pkl` file can execute code. Only load serialized files that you generated locally with View8.
