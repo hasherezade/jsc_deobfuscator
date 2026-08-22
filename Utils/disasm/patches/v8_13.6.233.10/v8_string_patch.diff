@@ -1,0 +1,24 @@
+diff --git a/src/objects/string.cc b/src/objects/string.cc
+index ce6cb8bc13e..45ce0067ed1 100644
+--- a/src/objects/string.cc
++++ b/src/objects/string.cc
+@@ -630,10 +630,17 @@ void String::PrintUC16(StringStream* accumulator, int start, int end) {
+       accumulator->Add("\\r");
+     } else if (c == '\\') {
+       accumulator->Add("\\\\");
+-    } else if (!std::isprint(c)) {
++    } else if (c >= 0x20 && c <= 0x7e) {
++      // Print only ASCII characters directly. StringCharacterStream returns
++      // UTF-16 code units, while std::isprint() is defined only for EOF or
++      // values representable as unsigned char. Passing arbitrary uint16_t
++      // values to std::isprint() is undefined behavior and may garble
++      // non-ASCII disassembly output.
++      accumulator->Put(static_cast<char>(c));
++    } else if (c <= 0xff) {
+       accumulator->Add("\\x%02x", c);
+     } else {
+-      accumulator->Put(static_cast<char>(c));
++      accumulator->Add("\\u%04x", c);
+     }
+   }
+ }
