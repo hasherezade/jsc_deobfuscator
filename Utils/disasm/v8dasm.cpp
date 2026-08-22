@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 #include <cstddef>
+#include <limits>
 
 #include "include/v8.h"
 #include "include/libplatform/libplatform.h"
@@ -145,5 +146,11 @@ int main(int argc, char* argv[])
 
   std::vector<std::byte> data;
   if (!readAllBytes(argv[1], data)) return 1;
-  loadBytecode((uint8_t*)data.data(), data.size());
+  if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    std::cerr << "Input file is too large\n";
+    return 1;
+  }
+  loadBytecode(
+      reinterpret_cast<uint8_t*>(data.data()),
+      static_cast<int>(data.size()));
 }
