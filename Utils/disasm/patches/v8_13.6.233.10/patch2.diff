@@ -1,0 +1,372 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 9a2b2cdd94f..b15f4d11bac 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -8150,3 +8150,20 @@ if (current_toolchain == default_toolchain) {
+ 
+   write_file("$root_build_dir/gn_logs.txt", _lines)
+ }
++
++v8_executable("v8dasm") {
++  sources = [
++    "v8dasm.cpp",
++  ]
++
++  configs = [
++    ":internal_config_base",
++  ]
++
++  deps = [
++    ":v8",
++    ":v8_libbase",
++    ":v8_libplatform",
++  ]
++}
++
+diff --git a/src/diagnostics/objects-printer.cc b/src/diagnostics/objects-printer.cc
+index 46c3ae89ca1..c19af390798 100644
+--- a/src/diagnostics/objects-printer.cc
++++ b/src/diagnostics/objects-printer.cc
+@@ -2324,72 +2324,29 @@ void SharedFunctionInfo::PrintSourceCode(std::ostream& os) {
+ }
+ 
+ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
++  // Analysis-only compatibility printer.
++  //
++  // View8 only needs the SharedFunctionInfo address plus the BytecodeArray
++  // disassembly. Avoid printing names, script/scope objects, code objects and
++  // feedback metadata here: those fields can contain references tied to the
++  // producer's read-only snapshot and are not required for decompilation.
+   PrintHeader(os, "SharedFunctionInfo");
+-  os << "\n - name: ";
++
++  // Preserve the identity of the function's shared name without attempting to
++  // print/dereference the String itself.  This is safe across a mismatched
++  // read-only snapshot and lets View8 correlate an opaque LdaGlobal name with
++  // the SharedFunctionInfo that implements that global function.
+   if (HasSharedName()) {
+-    os << Brief(Name());
+-  } else {
+-    os << "<no-shared-name>";
+-  }
+-  if (HasInferredName()) {
+-    os << "\n - inferred name: " << Brief(inferred_name());
+-  }
+-  if (class_scope_has_private_brand()) {
+-    os << "\n - class_scope_has_private_brand";
+-  }
+-  if (has_static_private_methods_or_accessors()) {
+-    os << "\n - has_static_private_methods_or_accessors";
+-  }
+-  if (private_name_lookup_skips_outer_class()) {
+-    os << "\n - private_name_lookup_skips_outer_class";
+-  }
+-  os << "\n - kind: " << kind();
+-  os << "\n - syntax kind: " << syntax_kind();
+-  os << "\n - function_map_index: " << function_map_index();
+-  os << "\n - formal_parameter_count: ";
+-  int formal_parameter_count = internal_formal_parameter_count_with_receiver();
+-  if (formal_parameter_count == kDontAdaptArgumentsSentinel) {
+-    os << "kDontAdaptArgumentsSentinel";
+-  } else {
+-    os << formal_parameter_count;
+-  }
+-  os << "\n - expected_nof_properties: "
+-     << static_cast<int>(expected_nof_properties());
+-  os << "\n - language_mode: " << language_mode();
+-  if (HasTrustedData()) {
+-    os << "\n - trusted_function_data: "
+-       << Brief(GetTrustedData(GetIsolateForSandbox(*this)));
+-  } else {
+-    os << "\n - trusted_function_data: <empty>";
+-  }
+-  os << "\n - untrusted_function_data: " << Brief(GetUntrustedData());
+-  os << "\n - code (from function_data): ";
+-  Isolate* isolate;
+-  if (GetIsolateFromHeapObject(*this, &isolate)) {
+-    os << Brief(GetCode(isolate));
+-  } else {
+-    os << kUnavailableString;
+-  }
+-  // Script files are often large, thus only print their {Brief} representation.
+-  os << "\n - script: " << Brief(script());
+-  os << "\n - function token position: " << function_token_position();
+-  os << "\n - start position: " << StartPosition();
+-  os << "\n - end position: " << EndPosition();
+-  os << "\n - scope info: " << Brief(scope_info());
+-  if (HasOuterScopeInfo()) {
+-    os << "\n - outer scope info: " << Brief(GetOuterScopeInfo());
+-  }
+-  os << "\n - length: " << length();
+-  os << "\n - feedback_metadata: ";
+-  if (HasFeedbackMetadata()) {
+-    feedback_metadata()->FeedbackMetadataPrint(os);
+-  } else {
+-    os << "<none>";
++    Tagged<String> shared_name = Name();
++    os << "\n - name_ref: ";
++    if (HeapLayout::InReadOnlySpace(shared_name)) {
++      os << "ROConst_0x";
++    } else {
++      os << "RawConst_0x";
++    }
++    os << std::hex << shared_name.ptr() << std::dec;
+   }
+-  os << "\n - function_literal_id: " << function_literal_id();
+-  os << "\n - unique_id: " << unique_id();
+-  os << "\n - age: " << age();
+-  os << "\n";
++
+   os << "\nStart BytecodeArray\n";
+ 
+   Isolate* bytecode_isolate;
+@@ -3623,13 +3580,14 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+     }
+ 
+     case SHARED_FUNCTION_INFO_TYPE: {
++      // Analysis-only compatibility mode.
++      //
++      // Do not call DebugNameCStr() here. A code cache produced against a
++      // different read-only snapshot can leave name references that are unsafe
++      // to dereference in this isolate. We only need the function boundary and
++      // bytecode for static recovery.
+       Tagged<SharedFunctionInfo> shared = Cast<SharedFunctionInfo>(*this);
+-      std::unique_ptr<char[]> debug_name = shared->DebugNameCStr();
+-      if (debug_name[0] != '\0') {
+-        os << "<SharedFunctionInfo " << debug_name.get() << ">";
+-      } else {
+-        os << "<SharedFunctionInfo>";
+-      }
++      os << "<SharedFunctionInfo>";
+       os << "\nStart SharedFunctionInfo\n";
+       shared->SharedFunctionInfoPrint(os);
+       os << "\nEnd SharedFunctionInfo\n";
+diff --git a/src/objects/bytecode-array.cc b/src/objects/bytecode-array.cc
+index 36f0a691db3..0c6222f53dc 100644
+--- a/src/objects/bytecode-array.cc
++++ b/src/objects/bytecode-array.cc
+@@ -5,10 +5,12 @@
+ #include "src/objects/bytecode-array.h"
+ 
+ #include <iomanip>
++#include <vector>
+ 
+ #include "src/codegen/handler-table.h"
+ #include "src/codegen/source-position-table.h"
+ #include "src/common/globals.h"
++#include "src/heap/read-only-heap.h"
+ #include "src/interpreter/bytecode-array-iterator.h"
+ #include "src/interpreter/bytecode-decoder.h"
+ #include "src/objects/bytecode-array-inl.h"
+@@ -157,10 +159,99 @@ void BytecodeArray::Disassemble(Handle<BytecodeArray> handle,
+     iterator.Advance();
+   }
+ 
+-  os << "Constant pool (size = " << handle->constant_pool()->length() << ")\n";
++  auto constant_pool = handle->constant_pool();
++  os << "Constant pool (size = " << constant_pool->length() << ")\n";
+ #ifdef OBJECT_PRINT
+-  if (handle->constant_pool()->length() > 0) {
+-    Print(handle->constant_pool(), os);
++  // Analysis-only compatibility mode for caches produced against a different
++  // read-only snapshot.
++  //
++  // Do not probe the map/type of every non-RO constant. With a mismatched
++  // producer snapshot, some entries can be malformed from the point of view of
++  // this isolate, and even an IsString()/IsSharedFunctionInfo() test may
++  // dereference an unsafe map pointer.
++  //
++  // Instead, use bytecode semantics to decide which constant-pool entries are
++  // worth dereferencing:
++  //   * every cache-local String (after excluding read-only-space objects),
++  //   * CreateClosure operand 0, which is expected to be SharedFunctionInfo.
++  //
++  // Everything else stays opaque. This preserves recursive function discovery
++  // while recovering global/property names and ordinary literals.
++  std::vector<uint8_t> closure_entry(constant_pool->length(), 0);
++  std::vector<uint8_t> name_entry(constant_pool->length(), 0);
++
++  interpreter::BytecodeArrayIterator constant_ref_it(handle);
++  while (!constant_ref_it.done()) {
++    interpreter::Bytecode bytecode = constant_ref_it.current_bytecode();
++
++    if (bytecode == interpreter::Bytecode::kCreateClosure) {
++      int index = constant_ref_it.GetIndexOperand(0);
++      if (index >= 0 && index < constant_pool->length()) {
++        closure_entry[index] = 1;
++      }
++    } else if (bytecode == interpreter::Bytecode::kLdaGlobal ||
++               bytecode == interpreter::Bytecode::kLdaGlobalInsideTypeof ||
++               bytecode == interpreter::Bytecode::kStaGlobal ||
++               bytecode == interpreter::Bytecode::kThrowReferenceErrorIfHole) {
++      // These bytecodes carry a Name/String constant as operand 0.
++      int index = constant_ref_it.GetIndexOperand(0);
++      if (index >= 0 && index < constant_pool->length()) {
++        name_entry[index] = 1;
++      }
++    } else if (bytecode == interpreter::Bytecode::kGetNamedProperty ||
++               bytecode == interpreter::Bytecode::kGetNamedPropertyFromSuper ||
++               bytecode == interpreter::Bytecode::kSetNamedProperty ||
++               bytecode == interpreter::Bytecode::kDefineNamedOwnProperty) {
++      // Operand 0 is the receiver/register, operand 1 is the Name/String.
++      int index = constant_ref_it.GetIndexOperand(1);
++      if (index >= 0 && index < constant_pool->length()) {
++        name_entry[index] = 1;
++      }
++    }
++
++    constant_ref_it.Advance();
++  }
++
++  os << " - length: " << constant_pool->length() << "\n";
++  for (int i = 0; i < constant_pool->length(); ++i) {
++    Tagged<Object> object = constant_pool->get(i);
++    os << i << ": ";
++
++    if (IsSmi(object)) {
++      os << Smi::ToInt(object) << "\n";
++      continue;
++    }
++
++    Tagged<HeapObject> heap_object = Cast<HeapObject>(object);
++    if (ReadOnlyHeap::Contains(heap_object)) {
++      os << "ROConst_0x" << std::hex << object.ptr() << std::dec << "\n";
++      continue;
++    }
++
++    // If bytecode semantics guarantee that this slot is a Name/String, print it
++    // even if a generic IsString() probe is unreliable under the mismatched
++    // snapshot. Read-only objects were already filtered above, so this only
++    // applies to cache-local objects reconstructed by the code deserializer.
++    if (name_entry[i]) {
++      os << Brief(object) << "\n";
++      continue;
++    }
++
++    // Recover every other cache-local String normally.
++    if (IsString(object)) {
++      os << Brief(object) << "\n";
++      continue;
++    }
++
++    if (closure_entry[i]) {
++      // CreateClosure guarantees the semantic role of this pool entry. Avoid a
++      // generic IsSharedFunctionInfo() probe and let the existing short printer
++      // recursively emit the child SharedFunctionInfo.
++      os << Brief(object) << "\n";
++      continue;
++    }
++
++    os << "RawConst_0x" << std::hex << object.ptr() << std::dec << "\n";
+   }
+ #endif
+ 
+diff --git a/src/objects/string.cc b/src/objects/string.cc
+index ce6cb8bc13e..45ce0067ed1 100644
+--- a/src/objects/string.cc
++++ b/src/objects/string.cc
+@@ -630,10 +630,17 @@ void String::PrintUC16(StringStream* accumulator, int start, int end) {
+       accumulator->Add("\\r");
+     } else if (c == '\\') {
+       accumulator->Add("\\\\");
+-    } else if (!std::isprint(c)) {
++    } else if (c >= 0x20 && c <= 0x7e) {
++      // Print only ASCII characters directly. StringCharacterStream returns
++      // UTF-16 code units, while std::isprint() is defined only for EOF or
++      // values representable as unsigned char. Passing arbitrary uint16_t
++      // values to std::isprint() is undefined behavior and may garble
++      // non-ASCII disassembly output.
++      accumulator->Put(static_cast<char>(c));
++    } else if (c <= 0xff) {
+       accumulator->Add("\\x%02x", c);
+     } else {
+-      accumulator->Put(static_cast<char>(c));
++      accumulator->Add("\\u%04x", c);
+     }
+   }
+ }
+diff --git a/src/snapshot/code-serializer.cc b/src/snapshot/code-serializer.cc
+index 36e008f59e5..057576a2f0d 100644
+--- a/src/snapshot/code-serializer.cc
++++ b/src/snapshot/code-serializer.cc
+@@ -771,7 +771,10 @@ SerializedCodeData::SerializedCodeData(const std::vector<uint8_t>* payload,
+ SerializedCodeSanityCheckResult SerializedCodeData::SanityCheck(
+     uint32_t expected_ro_snapshot_checksum,
+     uint32_t expected_source_hash) const {
+-  return SerializedCodeSanityCheckResult::kSuccess;
++  SerializedCodeSanityCheckResult result =
++      SanityCheckWithoutSource(expected_ro_snapshot_checksum);
++  if (result != SerializedCodeSanityCheckResult::kSuccess) return result;
++  return SanityCheckJustSource(expected_source_hash);
+ }
+ 
+ SerializedCodeSanityCheckResult SerializedCodeData::SanityCheckJustSource(
+@@ -797,13 +800,33 @@ SerializedCodeSanityCheckResult SerializedCodeData::SanityCheckWithoutSource(
+     return SerializedCodeSanityCheckResult::kVersionMismatch;
+   }
+   uint32_t flags_hash = GetHeaderValue(kFlagHashOffset);
++
++  PrintF("[i] Cache flags hash: 0x%08x\n", flags_hash);
++  PrintF("[i] Build flags hash: 0x%08x\n", FlagList::Hash());
++
+   if (flags_hash != FlagList::Hash()) {
+     return SerializedCodeSanityCheckResult::kFlagsMismatch;
+   }
+   uint32_t ro_snapshot_checksum =
+       GetHeaderValue(kReadOnlySnapshotChecksumOffset);
++
++  PrintF("[i] Cache RO snapshot checksum: 0x%08x\n",
++         ro_snapshot_checksum);
++  PrintF("[i] Build RO snapshot checksum: 0x%08x\n",
++         expected_ro_snapshot_checksum);
++
++  // Analysis-only compatibility mode. Keep magic/version/flags checks strict,
++  // but allow a cache produced against a different read-only snapshot to reach
++  // the object deserializer. Do not use this mode for executing untrusted code.
++  constexpr bool kAllowMismatchedReadOnlySnapshotForAnalysis = true;
+   if (ro_snapshot_checksum != expected_ro_snapshot_checksum) {
+-    return SerializedCodeSanityCheckResult::kReadOnlySnapshotChecksumMismatch;
++    if (!kAllowMismatchedReadOnlySnapshotForAnalysis) {
++      return SerializedCodeSanityCheckResult::
++          kReadOnlySnapshotChecksumMismatch;
++    }
++    PrintF(
++        "[!] WARNING: continuing despite RO snapshot checksum mismatch "
++        "(analysis-only mode)\n");
+   }
+   uint32_t payload_length = GetHeaderValue(kPayloadLengthOffset);
+   uint32_t max_payload_length = size_ - kHeaderSize;
+diff --git a/src/snapshot/deserializer.cc b/src/snapshot/deserializer.cc
+index 09ddc385edb..f1f4ca6aa62 100644
+--- a/src/snapshot/deserializer.cc
++++ b/src/snapshot/deserializer.cc
+@@ -349,6 +349,29 @@ Deserializer<IsolateT>::Deserializer(IsolateT* isolate,
+ template <typename IsolateT>
+ void Deserializer<IsolateT>::Rehash() {
+   DCHECK(should_rehash());
++
++  // Analysis-only compatibility mode.
++  //
++  // When deserializing code produced against a different read-only snapshot,
++  // hash-dependent objects can contain string hash / forwarding-table state
++  // that is only valid in the producer's snapshot. We have observed failures
++  // in both NameDictionary::Rehash() and DescriptorArray::Sort(), each ending
++  // in StringForwardingTable::GetRawHash().
++  //
++  // Keep should_rehash_ true so the normal user-code deserialization control
++  // flow and its invariants are preserved, but skip the actual queued rehash
++  // operations. This mode is only for static recovery/disassembly. The
++  // resulting heap must not be used for normal execution or hash-table lookup.
++  constexpr bool kSkipAllUserCodeRehashForAnalysis = true;
++
++  if (kSkipAllUserCodeRehashForAnalysis && deserializing_user_code()) {
++    PrintF(
++        "[!] WARNING: skipping %zu queued rehash operation(s) "
++        "(analysis-only mode)\n",
++        to_rehash_.size());
++    return;
++  }
++
+   for (DirectHandle<HeapObject> item : to_rehash_) {
+     item->RehashBasedOnMap(isolate());
+   }
