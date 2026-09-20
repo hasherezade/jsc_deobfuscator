@@ -272,12 +272,13 @@ def save_string_list(input_file, all_func):
     if len(strlist) == 0:
         print("This file does not have deobfuscated strings. Run deobfuscator first.")
         return
-    with open(filename, 'w') as f:
+
+    with open(filename, 'w', encoding='utf-8') as f:
         for line in strlist:
             f.write(f"{line}\n")
+
     print(f"Saved string list (total: {len(strlist)}) to: {filename}")
     return len(strlist)
-
 
 def list_metadata_strings(functions, unique=False):
     str_list = set() if unique else []
