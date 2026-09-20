@@ -130,7 +130,7 @@ def main():
     is_ok = deobf_scope_default(all_func, args.verbosity) 
     if not is_ok:
         print("Deobfuscating scopes failed!")
-        return
+
     unflattened_functions = set(deobf_unflat_default(
         all_func,
         args.verbosity,
