@@ -36,7 +36,7 @@ while IFS= read -r -d '' file; do
     destination="$PAYLOADS_DIR/${md5}.jsc.br"
     cp -v -- "$file" "$destination"
     found=1
-done < <(find "$source_root" -type f -name 'app.jsc' -print0)
+done < <(find "$source_root" -type f -name 'app.js*' -print0)
 
 if (( found == 0 )); then
     echo "No app.jsc files found under: $source_root" >&2
