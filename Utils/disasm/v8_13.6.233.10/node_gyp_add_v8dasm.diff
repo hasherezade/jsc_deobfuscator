@@ -1,0 +1,97 @@
+diff --git a/node.gyp b/node.gyp
+index abfce41..06ba009 100644
+--- a/node.gyp
++++ b/node.gyp
+@@ -1459,6 +1459,92 @@
+         }],
+       ],
+     }, # node_mksnapshot
++    {
++      # Standalone code-cache disassembler used by View8. Unlike the older
++      # standalone-V8 build, this target links against Node and embeds the
++      # exact startup snapshot generated for this Node build.
++      'target_name': 'v8dasm',
++      'type': 'executable',
++
++      'dependencies': [
++        '<(node_lib_target_name)',
++        'deps/histogram/histogram.gyp:histogram',
++        'deps/nbytes/nbytes.gyp:nbytes',
++      ],
++
++      'includes': [
++        'node.gypi'
++      ],
++
++      'include_dirs': [
++        'src',
++        'tools/msvs/genfiles',
++        'deps/v8/include',
++        'deps/cares/include',
++        'deps/uv/include',
++      ],
++
++      'defines': [
++        'NODE_ARCH="<(target_arch)"',
++        'NODE_PLATFORM="<(OS)"',
++        'NODE_WANT_INTERNALS=1',
++      ],
++
++      'sources': [
++        'tools/v8dasm/v8dasm_node24.cpp',
++      ],
++
++      'conditions': [
++        # Compile the same generated built-in snapshot into v8dasm that is
++        # compiled into node itself. Depending on the node executable gives
++        # us the generation ordering without creating a second snapshot action
++        # (or, worse, a subtly different snapshot).
++        ['node_use_node_snapshot=="true"', {
++          'dependencies': [
++            '<(node_core_target_name)',
++          ],
++          'sources': [
++            '<(SHARED_INTERMEDIATE_DIR)/node_snapshot.cc',
++          ],
++        }, {
++          'sources': [
++            'src/node_snapshot_stub.cc',
++          ],
++        }],
++
++        # Keep the executable's link environment aligned with node_mksnapshot
++        # and the rest of the Node embedding tools.
++        ['node_use_openssl=="true"', {
++          'dependencies': [
++            'deps/ncrypto/ncrypto.gyp:ncrypto',
++          ],
++          'defines': [
++            'HAVE_OPENSSL=1',
++          ],
++        }],
++        ['node_use_node_code_cache=="true"', {
++          'defines': [
++            'NODE_USE_NODE_CODE_CACHE=1',
++          ],
++        }],
++        ['v8_enable_inspector==1', {
++          'defines': [
++            'HAVE_INSPECTOR=1',
++          ],
++        }],
++        ['OS=="win"', {
++          'libraries': [
++            'Dbghelp.lib',
++            'winmm.lib',
++            'Ws2_32.lib',
++          ],
++        }],
++        # Avoid excessive LTO, matching node_mksnapshot/cctest helpers.
++        ['enable_lto=="true"', {
++          'ldflags': [ '-fno-lto' ],
++        }],
++      ],
++    }, # v8dasm
+   ], # end targets
+ 
+   'conditions': [

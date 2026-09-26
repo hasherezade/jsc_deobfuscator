@@ -1,0 +1,106 @@
+diff --git a/deps/v8/src/diagnostics/objects-printer.cc b/deps/v8/src/diagnostics/objects-printer.cc
+--- a/deps/v8/src/diagnostics/objects-printer.cc
++++ b/deps/v8/src/diagnostics/objects-printer.cc
+@@ -2370,7 +2370,6 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+   } else {
+     os << kUnavailableString;
+   }
+-  PrintSourceCode(os);
+   // Script files are often large, thus only print their {Brief} representation.
+   os << "\n - script: " << Brief(script());
+   os << "\n - function token position: " << function_token_position();
+@@ -2391,6 +2390,16 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+   os << "\n - unique_id: " << unique_id();
+   os << "\n - age: " << age();
+   os << "\n";
++  os << "\nStart BytecodeArray\n";
++
++  Isolate* bytecode_isolate;
++  if (HasBytecodeArray() &&
++      GetIsolateFromHeapObject(*this, &bytecode_isolate)) {
++    GetBytecodeArray(bytecode_isolate)->Disassemble(os);
++  }
++
++  os << "\nEnd BytecodeArray\n";
++  os << std::flush;
+ }
+ 
+ void SharedFunctionInfoWrapper::SharedFunctionInfoWrapperPrint(
+@@ -3490,14 +3499,24 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+       break;
+     case FIXED_ARRAY_TYPE:
+       os << "<FixedArray[" << Cast<FixedArray>(*this)->length() << "]>";
++      os << "\nStart FixedArray\n";
++      Cast<FixedArray>(*this)->FixedArrayPrint(os);
++      os << "\nEnd FixedArray\n";
+       break;
+     case OBJECT_BOILERPLATE_DESCRIPTION_TYPE:
+       os << "<ObjectBoilerplateDescription["
+          << Cast<ObjectBoilerplateDescription>(*this)->capacity() << "]>";
++      os << "\nStart ObjectBoilerplateDescription\n";
++      Cast<ObjectBoilerplateDescription>(*this)
++          ->ObjectBoilerplateDescriptionPrint(os);
++      os << "\nEnd ObjectBoilerplateDescription\n";
+       break;
+     case FIXED_DOUBLE_ARRAY_TYPE:
+       os << "<FixedDoubleArray[" << Cast<FixedDoubleArray>(*this)->length()
+          << "]>";
++      os << "\nStart FixedDoubleArray\n";
++      Cast<FixedDoubleArray>(*this)->FixedDoubleArrayPrint(os);
++      os << "\nEnd FixedDoubleArray\n";
+       break;
+     case BYTE_ARRAY_TYPE:
+       os << "<ByteArray[" << Cast<ByteArray>(*this)->length() << "]>";
+@@ -3595,6 +3614,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+       } else {
+         os << "<SharedFunctionInfo>";
+       }
++      os << "\nStart SharedFunctionInfo\n";
++      shared->SharedFunctionInfoPrint(os);
++      os << "\nEnd SharedFunctionInfo\n";
+       break;
+     }
+     case JS_MESSAGE_OBJECT_TYPE:
+diff --git a/deps/v8/src/objects/string.cc b/deps/v8/src/objects/string.cc
+--- a/deps/v8/src/objects/string.cc
++++ b/deps/v8/src/objects/string.cc
+@@ -606,13 +606,6 @@ void String::StringShortPrint(StringStream* accumulator) {
+   accumulator->Add("<String[%u]: ", len);
+   accumulator->Add(PrefixForDebugPrint());
+ 
+-  if (len > kMaxShortPrintLength) {
+-    accumulator->Add("...<truncated>>");
+-    accumulator->Add(SuffixForDebugPrint());
+-    accumulator->Put('>');
+-    return;
+-  }
+-
+   PrintUC16(accumulator, 0, len);
+   accumulator->Add(SuffixForDebugPrint());
+   accumulator->Put('>');
+diff --git a/deps/v8/src/snapshot/code-serializer.cc b/deps/v8/src/snapshot/code-serializer.cc
+--- a/deps/v8/src/snapshot/code-serializer.cc
++++ b/deps/v8/src/snapshot/code-serializer.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "src/snapshot/code-serializer.h"
+ 
++#include <iostream>
+ #include <memory>
+ 
+ #include "src/base/logging.h"
+@@ -547,7 +548,14 @@ MaybeDirectHandle<SharedFunctionInfo> CodeSerializer::Deserialize(
+ 
+   Tagged<Script> script = Cast<Script>(result->script());
+   script->set_deserialized(true);
++
++  std::cout << "\nStart SharedFunctionInfo\n";
++  result->SharedFunctionInfoPrint(std::cout);
++  std::cout << "\nEnd SharedFunctionInfo\n";
++  std::cout << std::flush;
++
+   BaselineBatchCompileIfSparkplugCompiled(isolate, script);
++
+   if (v8_flags.profile_deserialization) {
+     double ms = timer.Elapsed().InMillisecondsF();
+     int length = cached_data->length();
