@@ -2,7 +2,7 @@ diff --git a/src/objects/string.cc b/src/objects/string.cc
 index d5e64056d42..f2b9a8c7e31 100644
 --- a/src/objects/string.cc
 +++ b/src/objects/string.cc
-@@ -620,16 +620,21 @@ void String::PrintUC16(StringStream* accumulator, int start, int end) {
+@@ -620,16 +620,23 @@ void String::PrintUC16(StringStream* accumulator, int start, int end) {
    StringCharacterStream stream(*this, start);
    for (int i = start; i < end && stream.HasMore(); i++) {
      uint16_t c = stream.GetNext();
