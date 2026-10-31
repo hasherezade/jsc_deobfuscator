@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstddef>
 #include <cstdio>
+#include <type_traits>
+#include <utility>
 
 #ifdef _WIN32
 #include <fcntl.h>
