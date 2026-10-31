@@ -1,0 +1,3 @@
+# Keep patch files byte-oriented and portable across Windows/Linux.
+*.diff text eol=lf
+*.patch text eol=lf

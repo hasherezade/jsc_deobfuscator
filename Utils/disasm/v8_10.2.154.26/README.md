@@ -144,19 +144,19 @@ The resulting file is the `v8dasm` ELF executable.
 The Windows build uses the same V8 10.2.154.26 source and common disassembly
 patches. Two additional Windows patches are provided (available in the `win` subdirectory):
 
-- `v8_windows_build_monolith.diff` - enables the static V8 monolith build.
+- `v8_windows_build_monolith.diff` - adds the GN compatibility change needed for the Windows static-library build.
 - `v8_windows_build_disasm.diff` - adds the GN target for `v8dasm.exe`.
 
 The tested configuration uses:
 
-- Visual Studio 202x Community
+- Visual Studio 2022 Community
 - MSVC 14.29 (`v142`)
 - x64 target
 - V8 10.2.154.26
 
 ## Preparing the environment
 
-Install Visual Studio 202x with the **Desktop development with C++** workload and the MSVC 14.29 (`v142`) toolset. 
+Install Visual Studio 2022 with the **Desktop development with C++** workload and the MSVC 14.29 (`v142`) toolset. 
 You can do it from the menu of Visual Studio: `Tools` -> `Get Tools and Features` and from `Individual components` select: `MSVC v142 - VS 2019 C++ x64/x86 build tools`.
 
 Install/clone `depot_tools`. Example:
@@ -209,8 +209,9 @@ variables = _LoadEnvFromBat(args)
 return _ExtractImportantEnvironment(variables)
 ```
 
-The SDK version can be adjusted to one available on the system. The important
-compatibility requirement for this V8 branch is selecting MSVC 14.29.
+The `10.0.20348.0` SDK version above is the version used in the tested setup.
+It can be adjusted to one available on the system. The important compatibility
+requirement for this V8 branch is selecting MSVC 14.29.
 
 ## Building the V8 monolith
 
@@ -313,8 +314,8 @@ out.gn\x64.release\v8dasm.exe
 
 ## Usage on Windows
 
-Use the output-file argument supported by the Windows-compatible
-`v8dasm.cpp`:
+`v8dasm` accepts an optional output-file argument. On Windows, using it is
+recommended instead of PowerShell stdout redirection:
 
 ```powershell
 .\out.gn\x64.release\v8dasm.exe `
