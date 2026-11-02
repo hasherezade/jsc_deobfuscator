@@ -1,10 +1,7 @@
 # Windows helper scripts (Batch / cmd.exe)
 
 These `.bat` scripts automate the JSCeal bulk-processing workflow on Windows
-using only `cmd.exe` for orchestration. PowerShell is **not required**.
-
-This is useful on analysis machines where execution of PowerShell scripts is
-restricted by policy.
+using only `cmd.exe` for orchestration.
 
 The workflow uses the following workspace layout:
 
@@ -43,7 +40,7 @@ Edit `config.bat` before the first run. The most important variables are:
 
 ```bat
 set "JSC_DEOBF_ROOT=%USERPROFILE%\jsc_deobfuscator"
-set "V8DASM=%USERPROFILE%\code\v8\out.gn\x64.release\v8dasm.exe"
+set "V8DASM=%USERPROFILE%\bin\v8dasm.exe"
 set "PYTHON=python"
 set "NODE=node"
 set "DECOMPRESS_METHOD=js"
