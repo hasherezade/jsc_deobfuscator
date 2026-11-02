@@ -1,6 +1,6 @@
-# Windows helper scripts (Batch / cmd.exe)
+# Helper scripts (Windows)
 
-These `.bat` scripts automate the JSCeal bulk-processing workflow on Windows
+These Windows Batch scripts automate the JSCeal bulk-processing workflow on Windows
 using only `cmd.exe` for orchestration.
 
 The workflow uses the following workspace layout:

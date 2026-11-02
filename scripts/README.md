@@ -1,8 +1,10 @@
-# Helper scripts
+# Helper scripts (Linux)
 
 The helper scripts automate the JSCeal research workflow and batch processing
 with View8 and JSC Deobfuscator. All scripts and their shared configuration are
 kept in this directory.
+
+To run the same pipeline [on **Windows** use the Windows Batch version](https://github.com/hasherezade/jsc_deobfuscator/tree/main/scripts/windows).
 
 ## Configuration
 
