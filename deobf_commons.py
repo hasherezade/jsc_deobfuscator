@@ -273,7 +273,7 @@ def save_string_list(input_file, all_func):
         print("This file does not have deobfuscated strings. Run deobfuscator first.")
         return
 
-    with open(filename, 'w', encoding='utf-8') as f:
+    with open(filename, 'w', encoding='utf-8', newline='\n') as f:
         for line in strlist:
             f.write(f"{line}\n")
 

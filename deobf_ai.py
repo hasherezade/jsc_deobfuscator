@@ -369,7 +369,7 @@ def save_analysis(path: str, analysis: str):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(analysis)
         if not analysis.endswith('\n'):
             f.write('\n')
@@ -734,7 +734,7 @@ def write_to_csv(csv_file, old_name, new_name):
         if parent:
             os.makedirs(parent, exist_ok=True)
         with open(csv_file, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
+            writer = csv.writer(f, lineterminator='\n')
             writer.writerow([old_name, new_name])
         return True
     except Exception as e:
