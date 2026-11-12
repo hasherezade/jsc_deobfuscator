@@ -6,10 +6,12 @@ if not exist "%DEOBF_ALL%" (
     echo [ERROR] Deobfuscator entry point not found: %DEOBF_ALL% 1>&2
     exit /b 1
 )
-where "%PYTHON%" >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python command not found: %PYTHON% 1>&2
-    exit /b 1
+if not exist "%PYTHON%" (
+    where "%PYTHON%" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Python command not found: %PYTHON% 1>&2
+        exit /b 1
+    )
 )
 if not exist "%DEOBFUSCATED_DIR%\" mkdir "%DEOBFUSCATED_DIR%" || exit /b 1
 

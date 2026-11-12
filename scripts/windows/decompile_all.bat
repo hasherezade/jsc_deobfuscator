@@ -6,10 +6,12 @@ if not exist "%VIEW8%" (
     echo [ERROR] View8 entry point not found: %VIEW8% 1>&2
     exit /b 1
 )
-where "%PYTHON%" >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python command not found: %PYTHON% 1>&2
-    exit /b 1
+if not exist "%PYTHON%" (
+    where "%PYTHON%" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Python command not found: %PYTHON% 1>&2
+        exit /b 1
+    )
 )
 if not exist "%DECOMPILED_DIR%\" mkdir "%DECOMPILED_DIR%" || exit /b 1
 
