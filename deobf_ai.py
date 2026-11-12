@@ -734,7 +734,7 @@ def write_to_csv(csv_file, old_name, new_name):
         if parent:
             os.makedirs(parent, exist_ok=True)
         with open(csv_file, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f, lineterminator='\n')
+            writer = csv.writer(f)
             writer.writerow([old_name, new_name])
         return True
     except Exception as e:

@@ -1056,7 +1056,7 @@ def save_resolved_funcs_to_csv(resolved_funcs, csv_file):
             delete=False,
         ) as f:
             temp_path = f.name
-            writer = csv.writer(f, lineterminator='\n')
+            writer = csv.writer(f)
             # Write data
             for func_name, (number, boolean) in sorted(resolved_funcs.items()):
                 writer.writerow([func_name, number, boolean])
