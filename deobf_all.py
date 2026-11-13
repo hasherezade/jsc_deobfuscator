@@ -23,6 +23,7 @@ from deobf_str2 import (
     save_string_list,
 )
 from deobf_str1 import strings_deobfuscate_v1
+from deobf_str3 import strings_deobfuscate_v3, refresh_deobfuscated_strings_v3
 from deobf_scope2 import propagate_variables_default, deobf_scope_default
 from deobf_globals import propagate_globals
 from deobf_unflattener import deobf_unflat_default
@@ -98,7 +99,7 @@ def main():
                         default=['serialized', 'decompiled'])
     parser.add_argument('--csv', '-c', help="A CSV with resolved string deobfuscation functions. If omitted, defaults to <input_name>.resolved_funcs.csv.", default=None, required=False)
     parser.add_argument('--verbosity', '-v', help="Verbosity level (0-3)", default=0, type=int, required=False)
-    parser.add_argument('--str_deobf', help="Variant of the string deobfuscation function (1 or 2)", default=2, type=int, required=False)
+    parser.add_argument('--str_deobf', help="Variant of the string deobfuscation function (1, 2, or 3)", default=2, type=int, choices=(1, 2, 3), required=False)
     args = parser.parse_args()
     
     if not os.path.isfile(args.inp):
@@ -118,9 +119,11 @@ def main():
     str_start = time.perf_counter()
     is_ok = False
     if args.str_deobf == 1:
-        is_ok = strings_deobfuscate_v1(all_func)
+        is_ok = strings_deobfuscate_v1(all_func, args.verbosity)
+    elif args.str_deobf == 2:
+        is_ok = strings_deobfuscate_v2(all_func, args.verbosity, resolved_csv)
     else:
-        is_ok = strings_deobfuscate_v2(all_func, args.verbosity, resolved_csv) 
+        is_ok = strings_deobfuscate_v3(all_func, args.verbosity)
     if not is_ok:
         print("Deobfuscating strings failed!")
         return
@@ -136,9 +139,11 @@ def main():
         args.verbosity,
         return_changed=True,
     ) or ())
-    if args.str_deobf == 2:
+    if args.str_deobf in (2, 3):
         print("Refreshing decoded strings after unflattening...")
-        refresh_deobfuscated_strings(
+        refresh = (refresh_deobfuscated_strings if args.str_deobf == 2
+                   else refresh_deobfuscated_strings_v3)
+        refresh(
             all_func,
             args.verbosity,
             function_names=unflattened_functions,
@@ -159,13 +164,13 @@ def main():
     # Later simplification passes may expose the exact decoder callee or move a
     # known decoder call into its final expression. Run one last decoder-only
     # refresh before exporting so such calls cannot escape the string pass.
-    if args.str_deobf == 2:
+    if args.str_deobf in (2, 3):
         print("Final refresh of decoded strings...")
         dirty_functions = set(_changed_function_names(
             all_func,
             post_unflatten_snapshot,
         ))
-        refresh_deobfuscated_strings(
+        refresh(
             all_func,
             args.verbosity,
             function_names=dirty_functions,
@@ -181,7 +186,7 @@ def main():
     # The output may be saved into a file:
     if args.out:
         export_to_file(args.out, all_func, args.export_format)
-        save_string_list(args.out, all_func)
+        save_string_list(args.out, all_func, final_only=(args.str_deobf == 3))
     print(f"Done.")
 
 if __name__ == "__main__":

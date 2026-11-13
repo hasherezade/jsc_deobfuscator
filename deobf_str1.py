@@ -177,7 +177,7 @@ def hide_by_metadata(all_func):
 
 ###
 
-def strings_deobfuscate_v1(all_func, clean=True, strfunc=None):
+def strings_deobfuscate_v1(all_func, verbosity, clean=True, strfunc=None):
     global g_Verbosity
     global g_RootFunc
     global g_RootIndex
