@@ -244,7 +244,7 @@ def main():
     if args.scope:
         propagate_variables_default(all_func, 3, args.verbosity) 
 
-    strings_deobfuscate_v1(all_func, True, args.strfunc)
+    strings_deobfuscate_v1(all_func, g_Verbosity, True, args.strfunc)
 
     if args.out:
         export_to_file(args.out, all_func, args.export_format)
