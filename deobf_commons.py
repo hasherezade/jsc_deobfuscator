@@ -800,6 +800,132 @@ def _hide_dead_folded_literals(func, blocks, folded_regs):
     return hidden
 
 
+# Variant-3 cleanup follows the same principle as the historical
+# hide_unreferenced_variables() pass, but only removes side-effect-free
+# constants proven dead within a straight-line block.  The existing
+# historical implementation is deliberately not changed for variants 1/2.
+_SAFE_PURE_NUMBER = re.compile(r'^\(\s*-?\d+\s*\)$|^-?\d+$')
+_SAFE_STATIC_NUMBER_DICT = re.compile(
+    r'^new\s+\{\s*(?:"[^"\\]+"\s*:\s*-?\d+\s*,?\s*)*\}$'
+)
+
+
+def _safe_dead_constant_assignment(statement):
+    """Return its register for a pure literal assignment, else None.
+
+    Only register assignments with a statically understood RHS are eligible.
+    In particular, never discard calls or computed values just because they
+    currently have no visible textual consumers.
+    """
+    m = _SAFE_REG_DEF.match(statement)
+    if not m:
+        return None
+    rhs = statement[m.end():].strip()
+    if (_decode_safe_literal(rhs) is not None
+            or _SAFE_PURE_NUMBER.fullmatch(rhs)
+            or _SAFE_STATIC_NUMBER_DICT.fullmatch(rhs)):
+        return m.group(1)
+    return None
+
+
+def hide_safe_unreferenced_constants(functions, function_names=None):
+    """Hide dead numeric, string, and numeric-dictionary temporaries.
+
+    This is the control-flow-conservative analogue of the variant-2
+    hide_unreferenced_variables pass. It works on the *final* visible code,
+    after all replacement and inlining passes. Never crosses control-flow
+    boundaries or View8 jump targets, and skips functions without a reliable
+    jump-target map. It preserves lines (visible=False) in serialized View8.
+
+    A read in another block, or on a control-flow statement, makes that
+    register potentially live on block exit. A pure constant definition is
+    hidden only if there are no intervening visible reads of its value.
+    """
+    stats = {'hidden': 0, 'numbers': 0, 'strings': 0,
+             'dictionaries': 0, 'functions': 0, 'skipped_no_jump_map': 0}
+    selected = functions.items() if function_names is None else (
+        (name, functions[name]) for name in function_names if name in functions
+    )
+    for name, func in selected:
+        if not getattr(func, 'visible', True):
+            continue
+        metadata = getattr(func, 'metadata', None)
+        if not ((isinstance(metadata, dict) and metadata.get('jump_target_metadata_available') is True)
+                or metadata == 'Flattened'):
+            stats['skipped_no_jump_map'] += 1
+            continue
+        blocks = _safe_straight_line_blocks(func)
+        if not blocks:
+            continue
+        index_to_block = {
+            index: number for number, block in enumerate(blocks) for index in block
+        }
+        # A read after an unconditional definition within the same block
+        # does *not* require a value carried into that block. Only registers
+        # read before their first definition are conservatively live-in.
+        live_ins = [set() for _ in blocks]
+        external_reads = set()
+        for index, obj in enumerate(func.code):
+            if not obj.visible or not obj.decompiled:
+                continue
+            if index not in index_to_block:
+                external_reads.update(_safe_register_uses(obj.decompiled))
+        for number, block in enumerate(blocks):
+            definitions = set()
+            for index in block:
+                statement = func.code[index].decompiled
+                for reg in _safe_register_uses(statement):
+                    if reg not in definitions:
+                        live_ins[number].add(reg)
+                match = _SAFE_REG_DEF.match(statement)
+                if match:
+                    definitions.add(match.group(1))
+        live_in_counts = {}
+        for reads in live_ins:
+            for reg in reads:
+                live_in_counts[reg] = live_in_counts.get(reg, 0) + 1
+        outside_any = set(live_in_counts)
+        found = 0
+        for number, block in enumerate(blocks):
+            # Registers read in any other block must be assumed live-out,
+            # even when the textual use comes before this block.
+            # A value used by an entry to a different block may be live-out.
+            # Uses after a local definition in that other block do not count.
+            live = external_reads | (outside_any - {
+                reg for reg in live_ins[number]
+                if live_in_counts[reg] == 1
+            })
+            for index in reversed(block):
+                obj = func.code[index]
+                if not obj.visible or not obj.decompiled:
+                    continue
+                statement = obj.decompiled.strip()
+                definition = _SAFE_REG_DEF.match(statement)
+                reg = definition.group(1) if definition else None
+                reads = _safe_register_uses(statement)
+                dead_reg = _safe_dead_constant_assignment(statement)
+                if (dead_reg is not None and dead_reg not in live
+                        and not _safe_is_jump_target(obj)
+                        and not obj.get_metadata('CffGuardedRemainder')):
+                    rhs = statement[definition.end():].strip()
+                    obj.visible = False
+                    found += 1
+                    stats['hidden'] += 1
+                    if rhs.startswith('"'):
+                        stats['strings'] += 1
+                    elif rhs.startswith('new '):
+                        stats['dictionaries'] += 1
+                    else:
+                        stats['numbers'] += 1
+                    continue
+                if reg is not None:
+                    live.discard(reg)
+                live.update(reads)
+        if found:
+            stats['functions'] += 1
+    return stats
+
+
 def _simplify_chain_assignments_safe(functions, function_names=None,
                                      hide_superseded=False, stats=None):
     """Fold proven literal register strings without crossing control flow.
@@ -816,7 +942,8 @@ def _simplify_chain_assignments_safe(functions, function_names=None,
         if not getattr(func, 'visible', True):
             continue
         metadata = getattr(func, 'metadata', None)
-        if not isinstance(metadata, dict) or metadata.get('jump_target_metadata_available') is not True:
+        if not ((isinstance(metadata, dict) and metadata.get('jump_target_metadata_available') is True)
+                or metadata == 'Flattened'):
             continue
         blocks = _safe_straight_line_blocks(func)
         folded_regs = {}

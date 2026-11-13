@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from View8.Parser.shared_function_info import load_functions_from_file
 from View8.view8_util import export_to_file
-from deobf_commons import customB64, load_string_array, set_string_metadata, simplify_chain_assignments, save_string_list
+from deobf_commons import customB64, load_string_array, set_string_metadata, simplify_chain_assignments, save_string_list, hide_safe_unreferenced_constants
 from deobf_scope2 import propagate_variables_default
 from deobf_str2 import _fold_adjacent_string_literals_in_line
 
@@ -663,12 +663,13 @@ def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None
     _STATE = (resolved, chunks)
     _GRAPH = graph
     stats = process_calls(functions, resolved, chunks, verbosity)
-    folding = {}
-    consolidated = simplify_chain_assignments(
-        functions, safe=True, hide_superseded=True, stats=folding
-    )
-    print(f"Variant 3 initial replacements: {dict(stats)}; consolidated: {consolidated}; "
-          f"hidden dead string assignments: {folding.get('hidden', 0)}")
+    # Like variant 2, clean unused index/string temporaries in the filter
+    # itself.  Standalone and deobf_all.py calls now share this behavior.
+    cleanup = cleanup_variant3_dead_assignments(functions)
+    print(f"Variant 3 initial replacements: {dict(stats)}; "
+          f"consolidated: {cleanup['consolidated']}; "
+          f"hidden dead string assignments: {cleanup['hidden_folded_strings']}; "
+          f"hidden unused constants: {cleanup['hidden']}")
     if hide_decoders:
         summary = hide_variant3_decoder_functions(
             functions, resolved, strfunc, deobf_root, policy=hide_policy
@@ -686,14 +687,34 @@ def refresh_deobfuscated_strings_v3(functions, verbosity=0, function_names=None)
         return False
     resolved, chunks = _STATE
     stats = process_calls(functions, resolved, chunks, verbosity, function_names)
+    # A refresh can expose new string literals and make their index
+    # temporaries dead.  Clean only the functions processed by this refresh.
+    cleanup = cleanup_variant3_dead_assignments(functions, function_names)
+    print(f"Variant 3 refresh: {dict(stats)}; "
+          f"consolidated: {cleanup['consolidated']}; "
+          f"hidden dead string assignments: {cleanup['hidden_folded_strings']}; "
+          f"hidden unused constants: {cleanup['hidden']}")
+    return True
+
+
+def cleanup_variant3_dead_assignments(functions, function_names=None):
+    """Consolidate strings and hide provably dead constants in variant 3.
+
+    Invoked by initial decoding and subsequent decoder refreshes, regardless
+    of whether they run standalone or via deobf_all.py.  The safety checks
+    preserve control-flow boundaries, jump targets, and uncertain liveness.
+    Also supports functions marked ``Flattened`` by the unflattener.
+    """
     folding = {}
     consolidated = simplify_chain_assignments(
         functions, safe=True, function_names=function_names,
         hide_superseded=True, stats=folding
     )
-    print(f"Variant 3 refresh: {dict(stats)}; consolidated: {consolidated}; "
-          f"hidden dead string assignments: {folding.get('hidden', 0)}")
-    return True
+    stats = hide_safe_unreferenced_constants(functions, function_names)
+    stats['consolidated'] = consolidated
+    stats['hidden_folded_strings'] = folding.get('hidden', 0)
+    print(f'Variant 3 dead-constant cleanup: {stats}')
+    return stats
 
 
 def main():
@@ -703,8 +724,8 @@ def main():
     p.add_argument('--strfunc', help='Function whose const pool contains the chunk array')
     p.add_argument('--deobf-root', help='Optional manual leaf-decoder override (otherwise autodetect)')
     p.add_argument('--graph-out', help='Optional JSON caller/callee graph output')
-    p.add_argument('--mode', choices=('decode', 'strlist', 'hide', 'discover'), default='decode',
-                   help='Decode, collect strings, hide helpers, or discover the decoder graph only')
+    p.add_argument('--mode', choices=('decode', 'strlist', 'hide', 'discover', 'cleanup'), default='decode',
+                   help='Decode, collect strings, hide helpers, discover, or clean an existing .pkl')
     p.add_argument('--hide-policy', choices=('applied', 'referenced'), default='applied',
                    help='applied: match variant-2 cleanup; referenced: keep helpers still referenced by visible code')
     p.add_argument('--keep-decoder-functions', action='store_true',
@@ -719,7 +740,9 @@ def main():
     if args.mode == 'strlist':
         save_string_list(args.out or args.inp, functions, final_only=True)
         return
-    if args.mode in ('hide', 'discover'):
+    if args.mode == 'cleanup':
+        cleanup_variant3_dead_assignments(functions)
+    elif args.mode in ('hide', 'discover'):
         try:
             graph = auto_discover_variant3_decoder_graph(
                 functions, args.strfunc, args.deobf_root
