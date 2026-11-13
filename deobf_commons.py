@@ -8,6 +8,7 @@
 
 import os
 import ast
+import json
 import re
 import urllib.parse
 from bisect import bisect_left
@@ -266,9 +267,9 @@ def count_func_lines(func, visible_only=True):
 ###
 # String deobfuscation utilities
 
-def save_string_list(input_file, all_func):
+def save_string_list(input_file, all_func, final_only=False):
     filename = input_file + '.strings.txt'
-    strlist = list_metadata_strings(all_func)
+    strlist = list_metadata_strings(all_func, final_only=final_only)
     if len(strlist) == 0:
         print("This file does not have deobfuscated strings. Run deobfuscator first.")
         return
@@ -280,7 +281,9 @@ def save_string_list(input_file, all_func):
     print(f"Saved string list (total: {len(strlist)}) to: {filename}")
     return len(strlist)
 
-def list_metadata_strings(functions, unique=False):
+def list_metadata_strings(functions, unique=False, final_only=False):
+    if final_only:
+        return list_final_visible_strings(functions, unique=unique)
     str_list = set() if unique else []
 
     def _collect_string(my_str):
@@ -308,6 +311,127 @@ def list_metadata_strings(functions, unique=False):
 
     return str_list
 
+
+
+def list_final_visible_strings(functions, unique=False):
+    """Collect final string values in *visible* variant-3 pseudocode.
+
+    The normal metadata collector is intentionally exhaustive: it records a
+    string each time a decoder succeeds, even if that string is a partial
+    register value.  Some of those assignments remain visible because the
+    line-hiding pass is deliberately conservative at control-flow barriers.
+
+    For the final string inventory, skip decoded literals assigned to a
+    temporary register when there is no visible independent use of the value.
+    If the register is only consumed by a proven literal concatenation, record
+    the combined value at the use site rather than its constituent fragments.
+    Never discard a string merely because it is a substring of another: small
+    independent strings such as "get" and "default" must be preserved.
+
+    This is an output-only projection; it does not mutate View8 objects or
+    affect the serialized/decompiled program.  Indirect control-flow uses that
+    are not represented in the visible code cannot be inferred here.
+    """
+    result = []
+    seen = set()
+    def emit(value):
+        if unique:
+            if value in seen:
+                return
+            seen.add(value)
+        result.append(value)
+
+    for func in functions.values():
+        if not getattr(func, 'visible', True):
+            continue
+        # Each candidate is a visible stand-alone register string literal.
+        # We defer its inclusion until its subsequent uses have been scanned.
+        events = []  # (string, candidate-or-None); preserve original line order
+        bindings = {}  # register -> (literal_value, candidate)
+        for obj in func.code:
+            if not obj.visible or not obj.decompiled:
+                continue
+            statement = obj.decompiled.strip()
+            if not statement:
+                continue
+            meta = obj.get_metadata('string')
+            if isinstance(meta, str):
+                values = [meta]
+            elif isinstance(meta, set):
+                values = sorted(meta)
+            else:
+                values = []
+            # Ignore stale string annotations left from earlier transformations;
+            # unlike metadata, final source text has a definitive visible state.
+            literal_values = set()
+            for literal_match in re.finditer(_SAFE_LITERAL, statement):
+                decoded = _decode_safe_literal(literal_match.group(0))
+                if decoded is not None:
+                    literal_values.add(decoded)
+            values = [v for v in values if _string_metadata_key(v) in literal_values]
+
+            # Recognize safe inline (rN + "suffix") on a visible line, using
+            # only a previously observed, visible literal register definition.
+            masked = _mask_quoted_text(statement)
+            consumed_ranges = []
+            consumed_suffixes = set()
+            for match in _SAFE_INLINE_CONCAT.finditer(statement):
+                if masked[match.start()] != '(':
+                    continue  # a code-looking sequence inside a quoted string
+                reg, suffix_token = match.groups()
+                item = bindings.get(reg)
+                suffix = _decode_safe_literal(suffix_token)
+                if item is None or suffix is None:
+                    continue
+                base, _candidate = item
+                events.append((base + suffix, None))
+                consumed_suffixes.add(suffix)
+                consumed_ranges.append((match.start(), match.end()))
+
+            # A candidate is an independently useful string if a register has
+            # a read outside verified concatenations.  A concat-only read does
+            # not make the partial string a final value for the inventory.
+            residual = list(masked)
+            for begin, end in consumed_ranges:
+                residual[begin:end] = ' ' * (end - begin)
+            residual = ''.join(residual)
+            defs = _SAFE_REG_DEF.match(residual)
+            if defs:
+                residual = residual[defs.end():]
+            for reg in _SAFE_REG_TOKEN.findall(residual):
+                if reg in bindings:
+                    bindings[reg][1]['independent_read'] = True
+
+            assigned = _SAFE_REG_DEF.match(masked)
+            direct = _SAFE_ASSIGN_LITERAL.fullmatch(statement)
+            if direct:
+                reg, token = direct.groups()
+                value = _decode_safe_literal(token)
+                if value is not None and value in [_string_metadata_key(v) for v in values]:
+                    candidate = {'independent_read': False}
+                    events.append((value, candidate))
+                    bindings[reg] = (value, candidate)
+                    values = [v for v in values if _string_metadata_key(v) != value]
+                else:
+                    bindings.pop(reg, None)
+            elif assigned:
+                bindings.pop(assigned.group(1), None)
+
+            for value in values:
+                # Only omit a suffix when we successfully recovered the joined
+                # expression from the same visible line and known register.
+                if _string_metadata_key(value) not in consumed_suffixes:
+                    events.append((value, None))
+
+            # Branches and braces invalidate inferred register values on the
+            # *next* line. The current conditional may legitimately use one.
+            if _SAFE_CONTROL.match(statement):
+                bindings.clear()
+
+        for value, candidate in events:
+            if candidate is None or candidate['independent_read']:
+                emit(value)
+    return result
 
 def set_string_metadata(line_obj, string):
     if not isinstance(string, str):
@@ -469,10 +593,287 @@ def _simplify_chain_assignments(func):
     _hide_lines(func, lines_list, 0)
     return is_changed
 
-def simplify_chain_assignments(functions):
+def simplify_chain_assignments(functions, safe=False, function_names=None,
+                               hide_superseded=False, stats=None):
+    """Consolidate chained string assignments.
+
+    The historical routine is preserved for variants 1 and 2. Use ``safe=True``
+    for variant 3: it avoids hiding live register assignments and does not
+    propagate inferred constants across branch or jump-target boundaries.
+    """
+    if safe:
+        return _simplify_chain_assignments_safe(
+            functions, function_names, hide_superseded, stats
+        )
     for func in functions.values():
-        while(_simplify_chain_assignments(func)): 
+        while(_simplify_chain_assignments(func)):
             continue # try to simplify till possibilities are exhausted
+
+
+# Match only JSON-compatible quoted strings emitted by deobf_str3. A V8
+# source literal with unsupported JavaScript escapes (e.g. \xNN) is left alone.
+_SAFE_LITERAL = r'"(?:\\.|[^"\\])*"'
+_SAFE_ASSIGN_LITERAL = re.compile(r'^\s*(r\d+)\s*=\s*(' + _SAFE_LITERAL + r')\s*$')
+_SAFE_CONCAT = re.compile(r'^\(\s*(r\d+)\s*\+\s*(' + _SAFE_LITERAL + r')\s*\)$')
+_SAFE_REG = re.compile(r'^r\d+$')
+_SAFE_REG_UPDATE = re.compile(r'\b(r\d+)\s*(?:\+\+|--|\+=|-=|\*=|/=)')
+_SAFE_CONTROL = re.compile(
+    r'^(?:[{}]|}\s*else|if\b|else\b|while\b|for\b|do\b|'
+    r'switch\b|case\b|default\s*:|try\b|catch\b|finally\b|'
+    r'break\b|continue\b|return\b|throw\b|goto\b|yield\b|await\b)'
+)
+
+
+def _decode_safe_literal(value):
+    try:
+        text = json.loads(value)
+    except (ValueError, TypeError):
+        return None
+    return text if isinstance(text, str) else None
+
+
+_SAFE_INLINE_CONCAT = re.compile(r'\(\s*(r\d+)\s*\+\s*(' + _SAFE_LITERAL + r')\s*\)')
+_SAFE_REG_DEF = re.compile(r'^\s*(r\d+)\s*=(?!=)\s*')
+_SAFE_REG_TOKEN = re.compile(r'\br\d+\b')
+
+
+def _mask_quoted_text(value):
+    """Preserve text positions while masking JS string and comment contents.
+
+    This prevents replacing source-like syntax inside a string literal, and
+    prevents treating 'r5' inside a string or an inline comment as a use.
+    """
+    result = list(value)
+    quote = None
+    escaped = False
+    for i, char in enumerate(value):
+        if quote:
+            result[i] = ' '
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ('"', "'", '`'):
+            quote = char
+            result[i] = ' '
+        elif char == '#':
+            result[i:] = [' '] * (len(value) - i)
+            break
+    return ''.join(result)
+
+
+def _safe_register_uses(statement):
+    """Collect textually visible register reads, excluding a direct LHS def."""
+    masked = _mask_quoted_text(statement)
+    direct = _SAFE_REG_DEF.match(masked)
+    if direct:
+        # The RHS may still reference the register being defined.
+        return set(_SAFE_REG_TOKEN.findall(masked[direct.end():]))
+    return set(_SAFE_REG_TOKEN.findall(masked))
+
+
+def _safe_is_jump_target(obj):
+    return obj.get_metadata('is_jump_target') is True or (
+        isinstance(obj.get_metadata('incoming_jump_count'), int)
+        and obj.get_metadata('incoming_jump_count') > 0
+    )
+
+
+def _safe_straight_line_blocks(func):
+    """Partition visible code at statements and hidden bytecode jump targets."""
+    blocks = []
+    current = []
+    for index, obj in enumerate(func.code):
+        if _safe_is_jump_target(obj) and current:
+            blocks.append(current)
+            current = []
+        if not obj.visible or not obj.decompiled:
+            continue
+        if _SAFE_CONTROL.match(obj.decompiled.strip()):
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(index)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _fold_safe_concats(rhs, known):
+    """Fold literal concatenations even when nested in ToName or indexing.
+
+    Only parenthesized `rN + "literal"` expressions are folded.  References
+    inside quoted text are excluded, and unknown values are left unchanged.
+    Returns (new_rhs, registers_that_were_consumed).
+    """
+    masked = _mask_quoted_text(rhs)
+    consumed = set()
+    values = []
+    for match in reversed(list(_SAFE_INLINE_CONCAT.finditer(rhs))):
+        if masked[match.start()] != '(':
+            continue
+        reg, suffix_token = match.groups()
+        base = known.get(reg)
+        suffix = _decode_safe_literal(suffix_token)
+        if base is None or suffix is None:
+            continue
+        joined = base + suffix
+        replacement = json.dumps(joined, ensure_ascii=True)
+        rhs = rhs[:match.start()] + replacement + rhs[match.end():]
+        consumed.add(reg)
+        values.append(joined)
+    return rhs, consumed, values
+
+
+def _hide_dead_folded_literals(func, blocks, folded_regs):
+    """Hide only pure string definitions proven dead after consolidation.
+
+    A source register is eligible only when a literal concatenation involving
+    it was folded in the same straight-line block. We perform reverse textual
+    liveness in that block, treating *any* register read in another block or
+    at a control-flow boundary as a possible live-out use. This intentionally
+    sacrifices some removals in exchange for preserving branches and reuses.
+    """
+    index_to_block = {
+        index: number
+        for number, block in enumerate(blocks)
+        for index in block
+    }
+    external_uses = set()
+    uses_by_block = [set() for _ in blocks]
+    for index, obj in enumerate(func.code):
+        # Invisible View8 accumulator/transient lines were already removed
+        # from the visible data flow by preceding passes. Counting their
+        # obsolete reads would keep superseded assignments alive forever.
+        # Invisible jump targets still split blocks in the forward pass.
+        if not obj.visible or not obj.decompiled:
+            continue
+        reads = _safe_register_uses(obj.decompiled.strip())
+        number = index_to_block.get(index)
+        if number is None:
+            external_uses.update(reads)
+        else:
+            uses_by_block[number].update(reads)
+
+    # A register referenced by more than one block is potentially live-out
+    # of every one of those blocks. Build counts once to avoid O(blocks^2).
+    block_read_counts = {}
+    all_block_reads = set()
+    for reads in uses_by_block:
+        all_block_reads.update(reads)
+        for reg in reads:
+            block_read_counts[reg] = block_read_counts.get(reg, 0) + 1
+
+    hidden = 0
+    for number, block in enumerate(blocks):
+        eligible = folded_regs.get(number, set())
+        if not eligible:
+            continue
+        # Read outside this block = possible live-out, even if textually
+        # earlier (e.g., a flattened dispatcher can jump backwards).
+        local_only = {reg for reg in uses_by_block[number]
+                      if block_read_counts[reg] == 1}
+        live = external_uses | (all_block_reads - local_only)
+
+        for index in reversed(block):
+            obj = func.code[index]
+            if not obj.visible or not obj.decompiled:
+                continue
+            statement = obj.decompiled.strip()
+            definition = _SAFE_REG_DEF.match(statement)
+            reg = definition.group(1) if definition else None
+            reads = _safe_register_uses(statement)
+            if (reg in eligible and reg not in live
+                    and _SAFE_ASSIGN_LITERAL.fullmatch(statement)
+                    and not _safe_is_jump_target(obj)):
+                obj.visible = False
+                hidden += 1
+                # This line had no side effects, so its dead definition does
+                # not introduce any live register uses.
+                continue
+            if reg is not None:
+                live.discard(reg)
+            live.update(reads)
+    return hidden
+
+
+def _simplify_chain_assignments_safe(functions, function_names=None,
+                                     hide_superseded=False, stats=None):
+    """Fold proven literal register strings without crossing control flow.
+
+    With hide_superseded=True, remove only dead, side-effect-free literal
+    definitions whose concatenated value has been propagated. The original
+    function's lines remain present in the pickle with visible=False.
+    """
+    changed = 0
+    selected = functions.items() if function_names is None else (
+        (name, functions[name]) for name in function_names if name in functions
+    )
+    for _, func in selected:
+        if not getattr(func, 'visible', True):
+            continue
+        metadata = getattr(func, 'metadata', None)
+        if not isinstance(metadata, dict) or metadata.get('jump_target_metadata_available') is not True:
+            continue
+        blocks = _safe_straight_line_blocks(func)
+        folded_regs = {}
+        for block_number, block in enumerate(blocks):
+            known = {}
+            for index in block:
+                obj = func.code[index]
+                raw = obj.decompiled
+                statement = raw.strip()
+                direct = _SAFE_ASSIGN_LITERAL.fullmatch(statement)
+                if direct:
+                    reg, token = direct.groups()
+                    decoded = _decode_safe_literal(token)
+                    if decoded is None:
+                        known.pop(reg, None)
+                    else:
+                        known[reg] = decoded
+                    continue
+
+                lhs, rhs = split_rhs_lhs(raw)
+                if lhs is None:
+                    for reg in _SAFE_REG_UPDATE.findall(_mask_quoted_text(statement)):
+                        known.pop(reg, None)
+                    continue
+                lhs = lhs[:-1].strip()
+                rhs = rhs.strip()
+                is_reg = bool(_SAFE_REG.fullmatch(lhs))
+                # A side-effectful LHS could alter the register before its
+                # RHS is evaluated; don't fold in such cases.
+                if '(' not in lhs and ')' not in lhs:
+                    replacement_rhs, consumed, values = _fold_safe_concats(rhs, known)
+                    if consumed:
+                        obj.decompiled = raw[:len(raw) - len(raw.lstrip())] + (
+                            f'{lhs} = {replacement_rhs}'
+                        )
+                        for value in values:
+                            set_string_metadata(obj, value)
+                        sync_string_metadata(obj)
+                        changed += 1
+                        folded_regs.setdefault(block_number, set()).update(consumed)
+                        if is_reg:
+                            decoded = _decode_safe_literal(replacement_rhs)
+                            if decoded is not None:
+                                known[lhs] = decoded
+                            else:
+                                known.pop(lhs, None)
+                        continue
+                if is_reg:
+                    known.pop(lhs, None)
+                for reg in _SAFE_REG_UPDATE.findall(_mask_quoted_text(statement)):
+                    known.pop(reg, None)
+
+        if hide_superseded and folded_regs:
+            hidden = _hide_dead_folded_literals(func, blocks, folded_regs)
+            if stats is not None:
+                stats['hidden'] = stats.get('hidden', 0) + hidden
+    return changed
 
 ###
 # Mark reg definitions

@@ -22,9 +22,9 @@ from dataclasses import dataclass
 
 from View8.Parser.shared_function_info import load_functions_from_file
 from View8.view8_util import export_to_file
-from deobf_commons import customB64, load_string_array, set_string_metadata
+from deobf_commons import customB64, load_string_array, set_string_metadata, simplify_chain_assignments, save_string_list
 from deobf_scope2 import propagate_variables_default
-from deobf_str2 import _fold_adjacent_string_literals_in_line, save_string_list
+from deobf_str2 import _fold_adjacent_string_literals_in_line
 
 FUNC = r'func_[A-Za-z0-9_$]+_0x[0-9a-fA-F]+'
 FUNC_CALL = re.compile(r'(?<![A-Za-z0-9_$])(' + FUNC + r')\s*\(')
@@ -356,7 +356,12 @@ def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None
         return False
     _STATE = (resolved, chunks)
     stats = process_calls(functions, resolved, chunks, verbosity)
-    print(f'Variant 3 initial replacements: {dict(stats)}')
+    folding = {}
+    consolidated = simplify_chain_assignments(
+        functions, safe=True, hide_superseded=True, stats=folding
+    )
+    print(f"Variant 3 initial replacements: {dict(stats)}; consolidated: {consolidated}; "
+          f"hidden dead string assignments: {folding.get('hidden', 0)}")
     return True
 
 
@@ -365,7 +370,13 @@ def refresh_deobfuscated_strings_v3(functions, verbosity=0, function_names=None)
         return False
     resolved, chunks = _STATE
     stats = process_calls(functions, resolved, chunks, verbosity, function_names)
-    print(f'Variant 3 refresh: {dict(stats)}')
+    folding = {}
+    consolidated = simplify_chain_assignments(
+        functions, safe=True, function_names=function_names,
+        hide_superseded=True, stats=folding
+    )
+    print(f"Variant 3 refresh: {dict(stats)}; consolidated: {consolidated}; "
+          f"hidden dead string assignments: {folding.get('hidden', 0)}")
     return True
 
 
@@ -373,8 +384,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--inp', required=True, help='Trusted, locally generated View8 .dec.pkl')
     p.add_argument('--out', help='Output pseudocode filename (.pkl saved beside it when requested)')
-    p.add_argument('--strfunc', required=True, help='Function whose const pool contains the chunk array')
-    p.add_argument('--deobf-root', required=True, help='Leaf decoder which calls custom Base64')
+    p.add_argument('--strfunc', help='Function whose const pool contains the chunk array')
+    p.add_argument('--deobf-root', help='Leaf decoder which calls custom Base64')
+    p.add_argument('--mode', choices=('decode', 'strlist'), default='decode',
+                   help='Decode strings or rebuild the final string list from an existing .pkl')
     p.add_argument('--scope', type=int, choices=(0, 1), default=1)
     p.add_argument('--verbosity', type=int, default=0)
     p.add_argument('--export_format', nargs='+', choices=('decompiled', 'serialized'),
@@ -382,6 +395,11 @@ def main():
     args = p.parse_args()
     print(f'Loading trusted View8 serialized functions: {args.inp}', flush=True)
     functions = load_functions_from_file(args.inp)
+    if args.mode == 'strlist':
+        save_string_list(args.out or args.inp, functions, final_only=True)
+        return
+    if not args.strfunc or not args.deobf_root:
+        p.error('--strfunc and --deobf-root are required in decode mode')
     if args.scope:
         propagate_variables_default(functions, 3, args.verbosity)
     ok = strings_deobfuscate_v3(functions, args.verbosity, args.strfunc, args.deobf_root)
@@ -389,7 +407,7 @@ def main():
         raise SystemExit(1)
     if args.out:
         export_to_file(args.out, functions, args.export_format)
-        save_string_list(args.out, functions)
+        save_string_list(args.out, functions, final_only=True)
         print(f'Exported: {args.out}')
     else:
         print('No --out supplied; changes were not saved')
