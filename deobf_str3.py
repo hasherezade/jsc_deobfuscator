@@ -17,6 +17,7 @@ import argparse
 import ast
 import json
 import re
+from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
 
@@ -35,6 +36,8 @@ DICT_DEF = re.compile(r'^(r\d+)\s*=\s*new\s*(\{.*\})\s*$')
 R_PROP = re.compile(r'^(r\d+)\["([^"\\]+)"\]$')
 INT = re.compile(r'^-?\d+$')
 BLOCK = re.compile(r'^(?:[{}]|else\b|catch\b|finally\b|if\b|while\b|for\b|do\b|switch\b|case\b|default\s*:|try\b)')
+FUNCTION_REF = re.compile(r'(?<![A-Za-z0-9_$])(' + FUNC + r')(?![A-Za-z0-9_$])')
+_CUSTOM_B64_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='
 
 @dataclass(frozen=True)
 class Wrapper:
@@ -49,6 +52,49 @@ class Resolved:
     subtract: int      # array index = input - subtract
     input_slot: int
     depth: int
+
+
+@dataclass
+class DecoderGraph:
+    """One verified variant-3 decoder family and its caller-to-callee tree."""
+    provider: str
+    leaf: str
+    chunks: list
+    leaf_shift: int
+    resolved: dict
+    detected: dict
+    pending: dict
+    auxiliary: set
+    provider_aliases: set
+
+    def as_dict(self):
+        """Export edges in call direction, without embedding the string array."""
+        nodes = []
+        for name, value in sorted(self.resolved.items()):
+            nodes.append({"name": name, "role": "leaf" if name == self.leaf else "wrapper",
+                          "subtract": value.subtract, "index_argument": value.input_slot,
+                          "depth": value.depth})
+        nodes.append({"name": self.provider, "role": "chunk_array_provider"})
+        for name in sorted(self.auxiliary - {self.provider} - set(self.resolved)):
+            nodes.append({"name": name, "role": "decoder_auxiliary"})
+        edges = []
+        for name in sorted(set(self.resolved) - {self.leaf}):
+            wrapper = self.detected[name]
+            edges.append({"caller": name, "callee": wrapper.parent, "type": "wrapper_call"})
+        edges.append({"caller": self.leaf, "callee": self.provider, "type": "array_lookup"})
+        for name in sorted(self.auxiliary):
+            if name == self.provider:
+                continue
+            # The array provider aliases its cache helper; the leaf references
+            # the Base64 decoder helper. The exact relationship is recognizable
+            # from the corresponding function body, not inferred from names.
+            src = self.provider if name in self.provider_aliases else self.leaf
+            edges.append({"caller": src, "callee": name, "type": "decoder_helper"})
+        return {"variant": 3, "leaf": self.leaf, "provider": self.provider,
+                "chunks": len(self.chunks), "connected_wrappers": len(self.resolved) - 1,
+                "disconnected_wrapper_candidates": len(self.pending),
+                "nodes": nodes, "edges": edges}
+
 
 
 def visible_lines(func):
@@ -326,27 +372,287 @@ def process_calls(functions, resolved, chunks, verbosity=0, function_names=None)
     return counters
 
 
-_STATE = None
 
-def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None):
-    """Discover and apply variant-3 decoders; keep state for later refresh."""
-    global _STATE
-    _STATE = None
-    if not strfunc or not deobf_root:
-        print('Variant 3 requires --strfunc (array) and --deobf-root (leaf)')
+def identify_auxiliary_string_helpers(functions, strfunc, deobf_root):
+    """Identify the array provider's cached alias and the leaf's Base64 helper.
+
+    Only a concrete provider-alias assignment or a function containing the
+    expected custom Base64 alphabet qualifies. Do not hide unrelated functions
+    merely because they are called by the leaf.
+    """
+    auxiliary = set()
+    provider = functions.get(strfunc)
+    if provider is not None:
+        alias_pattern = re.compile(r'^' + re.escape(strfunc) + r'\s*=\s*(' + FUNC + r')$')
+        for line in visible_lines(provider):
+            match = alias_pattern.fullmatch(line)
+            if match and match.group(1) in functions:
+                auxiliary.add(match.group(1))
+
+    leaf = functions.get(deobf_root)
+    if leaf is not None:
+        for line in visible_lines(leaf):
+            # We only consider a helper referenced as the RHS of an assignment.
+            match = re.search(r'=\s*(' + FUNC + r')\s*$', line)
+            if not match:
+                continue
+            name = match.group(1)
+            candidate = functions.get(name)
+            if candidate is None or name in (strfunc, deobf_root):
+                continue
+            # This specific decoder scheme is already identified by its
+            # custom alphabet. A different decoder must not be guessed here.
+            if any(_CUSTOM_B64_ALPHABET in (obj.decompiled or '')
+                   for obj in candidate.code):
+                auxiliary.add(name)
+    return auxiliary
+
+
+# Auto-discovery is intentionally separate from caller-graph resolution. A
+# wrapper-shaped function by itself is not evidence of string deobfuscation.
+# The leaf must be tied to a chunk array AND the custom Base64 implementation.
+_ARRAY_MIN_ENTRIES = 64
+_INDEXED_CHUNK = re.compile(r'\br\d+\s*\[\s*a0\s*\]')
+
+
+def _chunk_array_candidates(functions, selected=None):
+    """Find large string arrays whose entries resemble short Base64 chunks.
+
+    Parsing only sizeable array literals avoids ast parsing of unrelated const
+    pools. No function metadata is changed during discovery.
+    """
+    selected = [selected] if selected else functions.keys()
+    arrays = {}
+    for name in selected:
+        func = functions.get(name)
+        if func is None:
+            continue
+        for literal in func.const_pool:
+            if not (literal.startswith('[') and len(literal) >= 256):
+                continue
+            try:
+                values = ast.literal_eval(literal)
+            except (SyntaxError, ValueError, MemoryError, TypeError):
+                continue
+            if not isinstance(values, list) or len(values) < _ARRAY_MIN_ENTRIES:
+                continue
+            if not all(isinstance(v, str) for v in values):
+                continue
+            # Don't mistake arbitrary long literal arrays for an encoded pool.
+            alphabet = set(_CUSTOM_B64_ALPHABET)
+            plausible = sum(1 for v in values if 2 <= len(v) <= 32 and set(v) <= alphabet)
+            if plausible / len(values) < .95:
+                continue
+            arrays[name] = values
+            break
+    return arrays
+
+
+def _b64_helper_names(functions):
+    # The distinctive alphabet is constant-pool data even when View8 has
+    # hidden or simplified the instructions referencing it.
+    return {name for name, func in functions.items()
+            if any(_CUSTOM_B64_ALPHABET in value for value in func.const_pool)}
+
+
+def _provider_alias(func, provider):
+    pattern = re.compile(r'^' + re.escape(provider) + r'\s*=\s*(' + FUNC + r')$')
+    return {m.group(1) for line in visible_lines(func)
+            if (m := pattern.fullmatch(line))}
+
+
+def _matches_base64_leaf(func, provider, helpers):
+    lines = visible_lines(func)
+    if not any(_INDEXED_CHUNK.search(line) for line in lines):
         return False
-    if deobf_root not in functions:
-        print(f'Leaf decoder not present: {deobf_root}')
+    # Require an invocation (not just an incidental mention) of the provider.
+    if not any(re.search(r'\b' + re.escape(provider) + r'\s*\(\s*\)', line)
+               for line in lines):
         return False
-    chunks = load_string_array(functions, strfunc)
-    if chunks is None:
+    if not any(re.search(r'=\s*' + re.escape(helper) + r'\s*$', line)
+               for line in lines for helper in helpers):
         return False
     try:
-        leaf_shift = infer_leaf_shift(functions[deobf_root])
-    except ValueError as e:
-        print(f'Unsafe variant-3 leaf: {e}')
+        infer_leaf_shift(func)
+    except ValueError:
         return False
-    resolved, detected, pending = resolve_graph(functions, deobf_root, leaf_shift)
+    return True
+
+
+def auto_discover_variant3_decoder_graph(functions, strfunc=None, deobf_root=None):
+    """Auto-select a unique evidence-backed (array provider, leaf) pair.
+
+    Optional names act as constraints/overrides for backwards compatibility.
+    Without overrides, refuse ambiguity rather than choosing a guess. The
+    graph includes *only* straightforward wrappers connected to the leaf.
+    """
+    if strfunc and strfunc not in functions:
+        raise ValueError(f'Specified chunk-array function not found: {strfunc}')
+    if deobf_root and deobf_root not in functions:
+        raise ValueError(f'Specified leaf decoder not found: {deobf_root}')
+    if strfunc and deobf_root:
+        # Preserve the earlier API and its small synthetic test arrays. The
+        # caller has explicitly supplied both identities; don't impose the
+        # automatic discovery heuristics on this manual override.
+        chunks = load_string_array(functions, strfunc)
+        arrays = {strfunc: chunks} if chunks else {}
+    else:
+        arrays = _chunk_array_candidates(functions, strfunc)
+    if not arrays:
+        raise ValueError('No candidate custom-Base64 chunk arrays found')
+    helpers = _b64_helper_names(functions) if not deobf_root else set()
+    matches = []
+    # Explicit names preserve the existing manual fallback. Unspecified names
+    # must satisfy both structural tests and a connected wrapper graph.
+    for provider, chunks in arrays.items():
+        if deobf_root:
+            leaf_candidates = [deobf_root]
+        else:
+            leaf_candidates = []
+            for name, func in functions.items():
+                if name == provider:
+                    continue
+                # Cheap early filter before building statement lists.
+                if any(provider + '()' in (obj.decompiled or '') for obj in func.code):
+                    leaf_candidates.append(name)
+        for leaf in leaf_candidates:
+            func = functions[leaf]
+            if deobf_root and not strfunc and not any(
+                    provider + '()' in (obj.decompiled or '') for obj in func.code):
+                continue
+            if not deobf_root and not _matches_base64_leaf(func, provider, helpers):
+                continue
+            try:
+                leaf_shift = infer_leaf_shift(func)
+            except ValueError:
+                continue
+            resolved, detected, pending = resolve_graph(functions, leaf, leaf_shift)
+            if len(resolved) <= 1:
+                continue
+            auxiliary = identify_auxiliary_string_helpers(functions, provider, leaf)
+            if not deobf_root and not (auxiliary & helpers):
+                continue
+            aliases = _provider_alias(functions[provider], provider)
+            matches.append(DecoderGraph(provider, leaf, chunks, leaf_shift,
+                                        resolved, detected, pending,
+                                        auxiliary, aliases))
+    if not matches:
+        raise ValueError('No uniquely connected Base64 decoder family found; '
+                         'use --strfunc and --deobf-root to inspect manually')
+    if len(matches) != 1:
+        names = ', '.join(f'{m.leaf} -> {m.provider} ({len(m.resolved)-1} wrappers)'
+                          for m in matches[:8])
+        raise ValueError(f'Ambiguous Base64 decoder families ({len(matches)}): {names}. '
+                         'Supply --strfunc / --deobf-root to disambiguate')
+    return matches[0]
+
+
+def write_variant3_graph(graph, path):
+    """Write explicit caller/callee edges for auditing and later cleanup."""
+    Path(path).write_text(json.dumps(graph.as_dict(), indent=2) + '\n', encoding='utf-8')
+
+
+def hide_variant3_decoder_functions(functions, resolved, strfunc, deobf_root,
+                                    policy='applied'):
+    """Hide identified string helpers *after* successful variant-3 decoding.
+
+    ``applied`` matches variant 2: hide decoded wrapper implementations,
+    the leaf, chunk-array provider and positively identified auxiliary helpers.
+    Some unresolved call sites can remain visible; this is a presentation-only
+    transformation, and their targets remain intact in the serialized objects.
+
+    ``referenced`` is conservative: any helper still referenced by a visible
+    non-helper function remains visible, along with its dependencies. This
+    includes first-class/indirect references, not only direct calls.
+    """
+    if policy not in ('applied', 'referenced'):
+        raise ValueError(f'Unknown decoder hiding policy: {policy}')
+    if deobf_root not in resolved or deobf_root not in functions or strfunc not in functions:
+        raise ValueError('Decoder root or chunk array provider is unavailable')
+
+    auxiliary = identify_auxiliary_string_helpers(functions, strfunc, deobf_root)
+    candidates = (set(resolved) | {strfunc} | auxiliary) & set(functions)
+    retained = set()
+    external_references = set()
+    residual_direct_calls = 0
+    for name, func in functions.items():
+        if name in candidates or not getattr(func, 'visible', True):
+            continue
+        for obj in func.code:
+            if not getattr(obj, 'visible', True) or not obj.decompiled or 'func_' not in obj.decompiled:
+                continue
+            source = obj.decompiled
+            names = {m.group(1) for m in FUNCTION_REF.finditer(source)} & candidates
+            if not names:
+                continue
+            external_references.update(names)
+            residual_direct_calls += sum(1 for m in FUNC_CALL.finditer(source)
+                                         if m.group(1) in candidates)
+
+    if policy == 'referenced':
+        # Preserve all ancestors of externally referenced decoder wrappers;
+        # otherwise retaining an unresolved wrapper without its parent and
+        # leaf would still leave the source listing incomplete.
+        retained.update(external_references)
+        pending = list(retained)
+        while pending:
+            name = pending.pop()
+            deps = set()
+            if name in resolved and name != deobf_root:
+                # The graph is resolved, but the wrapper body names its parent
+                # explicitly. Only follow recognized direct wrapper parents.
+                wrapper = parse_wrapper(functions[name])
+                if wrapper is not None:
+                    deps.add(wrapper.parent)
+            if name == deobf_root:
+                deps.add(strfunc)
+                deps.update(auxiliary - {strfunc})
+            if name == strfunc:
+                deps.update(auxiliary)
+            for dependency in deps & candidates:
+                if dependency not in retained:
+                    retained.add(dependency)
+                    pending.append(dependency)
+
+    hidden = 0
+    for name in candidates - retained:
+        func = functions[name]
+        if getattr(func, 'visible', True):
+            func.visible = False
+            hidden += 1
+
+    return {'identified': len(candidates), 'hidden': hidden,
+            'retained': len(retained), 'external_references': len(external_references),
+            'unresolved_direct_calls': residual_direct_calls,
+            'auxiliary': len(auxiliary)}
+
+
+def discover_variant3_decoder_graph(functions, strfunc=None, deobf_root=None):
+    """Backward-compatible resolver API; defaults to automatic discovery."""
+    return auto_discover_variant3_decoder_graph(functions, strfunc, deobf_root).resolved
+
+
+_STATE = None
+_GRAPH = None
+
+def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None,
+                           hide_decoders=True, hide_policy='applied'):
+    """Discover and apply variant-3 decoders; keep state for later refresh."""
+    global _STATE, _GRAPH
+    _STATE = None
+    _GRAPH = None
+    try:
+        graph = auto_discover_variant3_decoder_graph(functions, strfunc, deobf_root)
+    except ValueError as e:
+        print(f'Variant 3 discovery failed: {e}')
+        return False
+    strfunc, deobf_root = graph.provider, graph.leaf
+    chunks, leaf_shift = graph.chunks, graph.leaf_shift
+    resolved, detected, pending = graph.resolved, graph.detected, graph.pending
+    # Keep the existing provider metadata semantics after discovery, but do
+    # not mutate any function while merely probing candidates.
+    load_string_array(functions, strfunc)
+    print(f'Variant 3 discovered leaf={deobf_root}; array={strfunc}')
     print(f'Variant 3: {len(chunks)} chunks; leaf subtract={leaf_shift}; '
           f'{len(detected)} candidate wrappers; {len(resolved)-1} connected')
     if verbosity and pending:
@@ -355,6 +661,7 @@ def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None
         print('Variant 3: no decoder wrappers connected; no code modified')
         return False
     _STATE = (resolved, chunks)
+    _GRAPH = graph
     stats = process_calls(functions, resolved, chunks, verbosity)
     folding = {}
     consolidated = simplify_chain_assignments(
@@ -362,6 +669,15 @@ def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None
     )
     print(f"Variant 3 initial replacements: {dict(stats)}; consolidated: {consolidated}; "
           f"hidden dead string assignments: {folding.get('hidden', 0)}")
+    if hide_decoders:
+        summary = hide_variant3_decoder_functions(
+            functions, resolved, strfunc, deobf_root, policy=hide_policy
+        )
+        print(f'Variant 3 helper cleanup: {summary}')
+        if hide_policy == 'applied' and summary['unresolved_direct_calls']:
+            print('Note: unresolved decoder calls remain in the visible listing; '
+                  'their implementations are preserved in the serialized .pkl. '
+                  'Use --hide-policy referenced to keep those implementations visible.')
     return True
 
 
@@ -385,9 +701,14 @@ def main():
     p.add_argument('--inp', required=True, help='Trusted, locally generated View8 .dec.pkl')
     p.add_argument('--out', help='Output pseudocode filename (.pkl saved beside it when requested)')
     p.add_argument('--strfunc', help='Function whose const pool contains the chunk array')
-    p.add_argument('--deobf-root', help='Leaf decoder which calls custom Base64')
-    p.add_argument('--mode', choices=('decode', 'strlist'), default='decode',
-                   help='Decode strings or rebuild the final string list from an existing .pkl')
+    p.add_argument('--deobf-root', help='Optional manual leaf-decoder override (otherwise autodetect)')
+    p.add_argument('--graph-out', help='Optional JSON caller/callee graph output')
+    p.add_argument('--mode', choices=('decode', 'strlist', 'hide', 'discover'), default='decode',
+                   help='Decode, collect strings, hide helpers, or discover the decoder graph only')
+    p.add_argument('--hide-policy', choices=('applied', 'referenced'), default='applied',
+                   help='applied: match variant-2 cleanup; referenced: keep helpers still referenced by visible code')
+    p.add_argument('--keep-decoder-functions', action='store_true',
+                   help='Disable helper-function hiding when decoding (for debugging)')
     p.add_argument('--scope', type=int, choices=(0, 1), default=1)
     p.add_argument('--verbosity', type=int, default=0)
     p.add_argument('--export_format', nargs='+', choices=('decompiled', 'serialized'),
@@ -398,13 +719,38 @@ def main():
     if args.mode == 'strlist':
         save_string_list(args.out or args.inp, functions, final_only=True)
         return
-    if not args.strfunc or not args.deobf_root:
-        p.error('--strfunc and --deobf-root are required in decode mode')
-    if args.scope:
-        propagate_variables_default(functions, 3, args.verbosity)
-    ok = strings_deobfuscate_v3(functions, args.verbosity, args.strfunc, args.deobf_root)
-    if not ok:
-        raise SystemExit(1)
+    if args.mode in ('hide', 'discover'):
+        try:
+            graph = auto_discover_variant3_decoder_graph(
+                functions, args.strfunc, args.deobf_root
+            )
+        except ValueError as e:
+            p.error(str(e))
+        print(f'Variant 3 discovered leaf={graph.leaf}; array={graph.provider}; '
+              f'chunks={len(graph.chunks)}; connected wrappers={len(graph.resolved)-1}')
+        if args.graph_out:
+            write_variant3_graph(graph, args.graph_out)
+            print(f'Graph written: {args.graph_out}')
+        if args.mode == 'discover':
+            return
+        summary = hide_variant3_decoder_functions(
+            functions, graph.resolved, graph.provider, graph.leaf,
+            policy=args.hide_policy
+        )
+        print(f'Variant 3 helper cleanup: {summary}')
+    else:
+        if args.scope:
+            propagate_variables_default(functions, 3, args.verbosity)
+        ok = strings_deobfuscate_v3(
+            functions, args.verbosity, args.strfunc, args.deobf_root,
+            hide_decoders=not args.keep_decoder_functions,
+            hide_policy=args.hide_policy
+        )
+        if not ok:
+            raise SystemExit(1)
+        if args.graph_out and _GRAPH is not None:
+            write_variant3_graph(_GRAPH, args.graph_out)
+            print(f'Graph written: {args.graph_out}')
     if args.out:
         export_to_file(args.out, functions, args.export_format)
         save_string_list(args.out, functions, final_only=True)
