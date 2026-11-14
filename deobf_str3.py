@@ -38,6 +38,7 @@ INT = re.compile(r'^-?\d+$')
 BLOCK = re.compile(r'^(?:[{}]|else\b|catch\b|finally\b|if\b|while\b|for\b|do\b|switch\b|case\b|default\s*:|try\b)')
 FUNCTION_REF = re.compile(r'(?<![A-Za-z0-9_$])(' + FUNC + r')(?![A-Za-z0-9_$])')
 _CUSTOM_B64_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='
+_ADJACENT_LITERAL_OPERATOR = re.compile(r'"\s*\+\s*"')
 
 @dataclass(frozen=True)
 class Wrapper:
@@ -330,7 +331,47 @@ def replace_in_line(obj, resolved, chunks, known, counters, verbosity=0):
             print(f'{callee}({value}, ...) -> array[{location}] -> {decoded!r}')
     if changed:
         obj.decompiled = line
-        _fold_adjacent_string_literals_in_line(obj, verbosity)
+        # Use the same safe literal folding for newly decoded calls as for
+        # pre-existing literal expressions.
+        _fold_literal_pairs_in_visible_line(obj, verbosity, '<decoder replacement>')
+
+
+def _comment_start_outside_string(line):
+    """Locate a View8 '#' comment without mistaking '#' inside a literal."""
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in ('"', "'", '`'):
+            quote = char
+        elif char == '#':
+            return index
+    return None
+
+
+def _fold_literal_pairs_in_visible_line(obj, verbosity, name):
+    """Reuse variant 2's literal folding without changing View8 comments."""
+    raw = obj.decompiled
+    if '+' not in raw or not _ADJACENT_LITERAL_OPERATOR.search(raw):
+        return 0
+    comment_at = _comment_start_outside_string(raw) if '#' in raw else None
+    if comment_at is None:
+        return _fold_adjacent_string_literals_in_line(obj, verbosity, name)
+    before, comment = raw[:comment_at], raw[comment_at:]
+    if not _ADJACENT_LITERAL_OPERATOR.search(before):
+        return 0
+    obj.decompiled = before
+    try:
+        count = _fold_adjacent_string_literals_in_line(obj, verbosity, name)
+    finally:
+        obj.decompiled += comment
+    return count
 
 
 def process_calls(functions, resolved, chunks, verbosity=0, function_names=None):
@@ -347,6 +388,15 @@ def process_calls(functions, resolved, chunks, verbosity=0, function_names=None)
         for obj in func.code:
             if not getattr(obj, 'visible', True) or not obj.decompiled:
                 continue
+            # Decoder replacement folds the lines it changes, but View8 can
+            # also emit literal + literal expressions that contain no decoder
+            # call (including inside return expressions and property accesses).
+            # Fold them here while walking the code for decoder calls, rather
+            # than paying for a second corpus-wide scan. Refreshes already
+            # restrict this walk to changed functions.
+            joined = _fold_literal_pairs_in_visible_line(obj, verbosity, name)
+            if joined:
+                counters['adjacent_literals_folded'] += joined
             line = obj.decompiled.strip()
             # Local property values are valid only in the same straight-line
             # block. Invalidate on branches rather than guessing the path.
@@ -741,6 +791,11 @@ def main():
         save_string_list(args.out or args.inp, functions, final_only=True)
         return
     if args.mode == 'cleanup':
+        # Old serialized outputs can receive this literal-only refinement
+        # without repeating decoder discovery or deobfuscation.
+        folded = process_calls(functions, {}, [], args.verbosity)
+        print(f"Variant 3 cleanup-only adjacent literal folds: "
+              f"{folded.get('adjacent_literals_folded', 0)}")
         cleanup_variant3_dead_assignments(functions)
     elif args.mode in ('hide', 'discover'):
         try:
