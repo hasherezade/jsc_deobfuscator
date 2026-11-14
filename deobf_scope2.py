@@ -273,6 +273,54 @@ def replace_with_assigned(
     return missing_keys
 ###
 
+_DICT_REGISTER_RE = re.compile(r'\br\d+\b')
+_DICT_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+_DICT_BRANCH_RE = re.compile(
+    r'^\s*(?:if\b|else\b|switch\b|case\b|default\s*:|'
+    r'while\b|for\b|try\b|catch\b|finally\b|'
+    r'break\b|continue\b|goto\b|CASE_\d+\s*=)'
+)
+
+
+def _has_remaining_dict_references(func, end_index, reg, alias):
+    """Detect live dictionary uses that simple literal-key replacement missed.
+
+    Computed lookups, mutations, and passing the dictionary as an argument
+    must prevent hiding its definitions. Plain overwrites of the two known
+    dictionary registers do not count as uses of the old value. Conservatively
+    leave definitions visible whenever another use might remain.
+    """
+    live = {reg, alias}
+    across_control_flow = False
+
+    for obj in func.code[end_index + 1:]:
+        if not obj.visible or not obj.decompiled:
+            continue
+        line = _DICT_LITERAL_RE.sub('""', obj.decompiled)
+        if _DICT_BRANCH_RE.match(line) or line.strip() in ('{', '}'):
+            across_control_flow = True
+        assign_i = find_assignment_op(line)
+        if assign_i is None:
+            if live.intersection(_DICT_REGISTER_RE.findall(line)):
+                return True
+            continue
+
+        lhs, rhs = line[:assign_i].strip(), line[assign_i + 1:]
+        if live.intersection(_DICT_REGISTER_RE.findall(rhs)):
+            return True
+        if re.fullmatch(r'r\d+', lhs):
+            # A write in a branch may not execute. Only retire aliases in
+            # regions that are demonstrably straight-line in this listing.
+            if not across_control_flow:
+                live.discard(lhs)
+            if not live:
+                return False
+        elif live.intersection(_DICT_REGISTER_RE.findall(lhs)):
+            return True  # includes rN[computed] = value
+
+    return False
+
+
 def _propagate_local_dict_in_func(func, start_index, verbosity):
     """
     Propagate local dicts definitions within the function. Returns index to continue search.
@@ -338,8 +386,13 @@ def _propagate_local_dict_in_func(func, start_index, verbosity):
         print(f"Defined: {reg}; Solved: {all_solved}; Assigned: {last_line}; Reg to: `{regTo}`")
         print(f"Content: {reg_dict}")
 
-    if not missing_keys:
-        # hide the lines with the original definitions:
+    # Literal-key substitutions may leave computed lookups or other uses of
+    # the dictionary. Keep its definitions whenever a consumer remains.
+    # An incomplete dictionary can still be removed if none of its remaining
+    # visible consumers require it (e.g. obsolete CFF bookkeeping entries).
+    if not missing_keys and not _has_remaining_dict_references(
+        func, end_index, reg, regTo
+    ):
         defLineIndx.append(start_index)
         defLineIndx.append(end_index)
         hide_lines(func, defLineIndx)
