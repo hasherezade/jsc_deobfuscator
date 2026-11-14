@@ -336,43 +336,13 @@ def replace_in_line(obj, resolved, chunks, known, counters, verbosity=0):
         _fold_literal_pairs_in_visible_line(obj, verbosity, '<decoder replacement>')
 
 
-def _comment_start_outside_string(line):
-    """Locate a View8 '#' comment without mistaking '#' inside a literal."""
-    quote = None
-    escaped = False
-    for index, char in enumerate(line):
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == '\\':
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif char in ('"', "'", '`'):
-            quote = char
-        elif char == '#':
-            return index
-    return None
-
-
 def _fold_literal_pairs_in_visible_line(obj, verbosity, name):
-    """Reuse variant 2's literal folding without changing View8 comments."""
+    """Fold adjacent string literals using the variant-2 implementation."""
     raw = obj.decompiled
     if '+' not in raw or not _ADJACENT_LITERAL_OPERATOR.search(raw):
         return 0
-    comment_at = _comment_start_outside_string(raw) if '#' in raw else None
-    if comment_at is None:
-        return _fold_adjacent_string_literals_in_line(obj, verbosity, name)
-    before, comment = raw[:comment_at], raw[comment_at:]
-    if not _ADJACENT_LITERAL_OPERATOR.search(before):
-        return 0
-    obj.decompiled = before
-    try:
-        count = _fold_adjacent_string_literals_in_line(obj, verbosity, name)
-    finally:
-        obj.decompiled += comment
-    return count
-
+    return _fold_adjacent_string_literals_in_line(obj, verbosity, name)
+    
 
 def process_calls(functions, resolved, chunks, verbosity=0, function_names=None):
     """Process only visible functions, ignoring decoder implementations."""
