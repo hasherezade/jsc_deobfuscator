@@ -130,9 +130,13 @@ def atom_number(expr, locals_map):
     expr = expr.strip()
     if INT.fullmatch(expr):
         return int(expr)
+    if re.fullmatch(r'r\d+', expr):
+        value = locals_map.get(expr)
+        return value if type(value) is int else None
     m = R_PROP.fullmatch(expr)
     if m:
-        return locals_map.get(m.group(1), {}).get(m.group(2))
+        value = locals_map.get(m.group(1))
+        return value.get(m.group(2)) if isinstance(value, dict) else None
     return None
 
 
@@ -409,7 +413,13 @@ def process_calls(functions, resolved, chunks, verbosity=0, function_names=None)
                 replace_in_line(obj, resolved, chunks, known, counters, verbosity)
             a = ASSIGN.fullmatch(line)
             if a and not d:
+                # Track exact numeric aliases only inside a straight-line
+                # block.  This lets numeric decoder indices held in a
+                # temporary register be resolved without guessing flow.
+                value = signed_number(a.group(2), known)
                 known.pop(a.group(1), None)
+                if value is not None:
+                    known[a.group(1)] = value
     return counters
 
 

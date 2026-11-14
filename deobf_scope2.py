@@ -328,8 +328,20 @@ def _unconditional_rebindings_after_branches(func, end_index):
     is left to the existing conservative liveness guard.
     """
     metadata = getattr(func, 'metadata', None)
-    if not (isinstance(metadata, dict)
-            and metadata.get('jump_target_metadata_available') is True):
+    trusted_map = (isinstance(metadata, dict)
+                   and metadata.get('jump_target_metadata_available') is True)
+    # Unflattening stores a "Flattened" marker rather than retaining the
+    # function-level jump-map flag.  Recognize only its simple structured
+    # result: no remaining loops, jumps, switches, or exception handling.
+    # The existing per-line jump-target checks below still apply.
+    flattened_structured = metadata == 'Flattened'
+    if flattened_structured:
+        flattened_structured = not any(
+            obj.visible and obj.decompiled and
+            _DICT_COMPLEX_FLOW_RE.match(obj.decompiled.strip())
+            for obj in func.code[end_index + 1:]
+        )
+    if not (trusted_map or flattened_structured):
         return set()
 
     depth = 0
@@ -1310,6 +1322,51 @@ def _replace_functions_via_registers(func, verbosity, only_functions=None):
         r'CASE_[A-Za-z0-9_]+\s*=|[A-Za-z0-9_$]+\s*:)'
     ) if only_functions is not None else None
 
+    # A decoder function stored in a register at function entry can remain
+    # valid across later branches if its register is never redefined.  This
+    # is narrower than carrying arbitrary per-block aliases across control
+    # flow: require an entry-block definition and no other writes anywhere.
+    stable_aliases = {}
+    stable_definitions = {}
+    if only_functions is not None:
+        entry_block = True
+        writes = {}
+        candidates = {}
+        entry_barrier = re.compile(
+            r'^(?:if\b|else\b|while\b|for\b|switch\b|case\b|'
+            r'default\b|try\b|catch\b|finally\b|do\b|goto\b|'
+            r'break\b|continue\b|return\b|throw\b|'
+            r'CASE_[A-Za-z0-9_]+\s*=|[A-Za-z0-9_$]+\s*:)'
+        )
+        depth = 0
+        for idx, obj in enumerate(func.code):
+            if not obj.visible or not obj.decompiled:
+                continue
+            stmt = obj.decompiled.strip()
+            if stmt == '{':
+                depth += 1
+                continue
+            if stmt == '}':
+                depth -= 1
+                continue
+            m_assign = re.match(patternAssign, stmt)
+            if m_assign:
+                writes[m_assign.group(1)] = writes.get(m_assign.group(1), 0) + 1
+                m_def = re.fullmatch(patternDef, stmt)
+                if (entry_block and depth == 1 and m_def and
+                        m_def.group(2) in only_functions and
+                        not obj.get_metadata('is_jump_target') and
+                        not obj.get_metadata('incoming_jump_count')):
+                    candidates[m_def.group(1)] = (m_def.group(2), idx)
+            if (depth != 1 or entry_barrier.match(stmt) or
+                    obj.get_metadata('is_jump_target') or
+                    obj.get_metadata('incoming_jump_count')):
+                entry_block = False
+        for reg, (callee, idx) in candidates.items():
+            if writes.get(reg) == 1:
+                stable_aliases[reg] = callee
+                stable_definitions[reg] = idx
+
     replaced = 0
     i = 0
     while True:
@@ -1321,6 +1378,8 @@ def _replace_functions_via_registers(func, verbosity, only_functions=None):
         if barrier and barrier.match(line.strip()):
             reg_to_func.clear()
             assign_lines.clear()
+            reg_to_func.update(stable_aliases)
+            assign_lines.update(stable_definitions)
         assign_reg = None
         # ----------------------------------------------------
         # Assignment
