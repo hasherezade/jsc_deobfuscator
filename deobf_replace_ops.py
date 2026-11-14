@@ -175,21 +175,55 @@ def _find_funcs_in_line(line, func_dict):
     return results
 
 def hide_unreferenced_functions(functions, func_dict, verbosity):
-    referenced = set()
-    for func in functions.values():
-        for i in range(len(func.code)):
-            line_obj = func.code[i]
+    """Hide operator helpers no longer reachable from visible non-helpers.
+
+    Replacements can leave an unused *chain* of operator helpers. A helper
+    referenced only by an already hidden function, or by another unused
+    helper, should not remain visible merely because that reference still
+    exists in its stored View8 code. Conversely, keep any helper reachable
+    through a visible reference, including unresolved aliases/dictionaries.
+    """
+    op_names = set(func_dict).intersection(functions)
+    if not op_names:
+        return 0
+
+    root_refs = set()
+    helper_refs = {}
+    for name, func in functions.items():
+        if not getattr(func, 'visible', True):
+            continue
+        refs = set()
+        for line_obj in func.code:
             if not line_obj.visible or not line_obj.decompiled:
                 continue
-            funcs = _find_funcs_in_line(line_obj.decompiled, func_dict)
-            referenced.update(funcs)
+            line = line_obj.decompiled
+            if 'func_' in line:
+                refs.update(_find_funcs_in_line(line, op_names))
+        if name in op_names:
+            helper_refs[name] = refs
+        else:
+            root_refs.update(refs)
+
+    # A single graph traversal replaces repeated full-corpus reference scans.
+    # A helper is live if any visible ordinary function reaches it, possibly
+    # through other helper definitions that could not yet be inlined.
+    live = set()
+    pending = list(root_refs)
+    while pending:
+        name = pending.pop()
+        if name in live:
+            continue
+        live.add(name)
+        pending.extend(helper_refs.get(name, ()) - live)
+
     hidden = 0
-    for func_name in func_dict.keys():
-        if func_name not in referenced:
-            functions[func_name].visible = False
+    for name in op_names - live:
+        func = functions[name]
+        if func.visible:
+            func.visible = False
             hidden += 1
             if verbosity:
-                print(f"Hiding: {func_name}")
+                print(f"Hiding: {name}")
     return hidden
 
 

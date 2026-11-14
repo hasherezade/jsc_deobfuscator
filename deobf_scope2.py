@@ -282,18 +282,136 @@ _DICT_BRANCH_RE = re.compile(
 )
 
 
-def _has_remaining_dict_references(func, end_index, reg, alias):
-    """Detect live dictionary uses that simple literal-key replacement missed.
+def _is_unread_register_copy_target(func, start_index, dst_reg):
+    """Prove that a copied-to register is never read after this assignment.
 
-    Computed lookups, mutations, and passing the dictionary as an argument
-    must prevent hiding its definitions. Plain overwrites of the two known
-    dictionary registers do not count as uses of the old value. Conservatively
-    leave definitions visible whenever another use might remain.
+    This is deliberately stronger than just checking the next instruction:
+    a read on *any* visible path keeps the copy.  It is safe to ignore pure
+    overwrites of dst_reg; a write through dst_reg (e.g. dst_reg[key] = x)
+    still counts as a use.  String literals cannot contain register reads.
+    """
+    for obj in func.code[start_index + 1:]:
+        if not obj.visible or not obj.decompiled:
+            continue
+        line = _DICT_LITERAL_RE.sub('""', obj.decompiled)
+        if dst_reg not in _DICT_REGISTER_RE.findall(line):
+            continue
+        assign_i = find_assignment_op(line)
+        if assign_i is not None and line[:assign_i].strip() == dst_reg:
+            # A direct overwrite is not a use, unless the RHS itself reads
+            # the old register (e.g. r6 = r6 + 1).
+            if dst_reg not in _DICT_REGISTER_RE.findall(line[assign_i + 1:]):
+                continue
+        return False
+    return True
+
+
+
+_DICT_IF_ELSE_RE = re.compile(r'^\s*(?:if\b|else\b)')
+_DICT_COMPLEX_FLOW_RE = re.compile(
+    r'^\s*(?:while\b|for\b|do\b|switch\b|case\b|default\s*:|'
+    r'try\b|catch\b|finally\b|goto\b|break\b|continue\b|'
+    r'CASE_\d+\s*=)'
+)
+
+
+def _unconditional_rebindings_after_branches(func, end_index):
+    """Find register writes that definitely retire a previous alias value.
+
+    A conditional that has already *joined* does not make every subsequent
+    top-level write conditional. We recognize only simple, well-braced `if`
+    regions with trusted View8 jump-target information. A direct write must
+    be outside those regions and after the last visible jump target, so a
+    forward jump cannot skip it and then reach a use of the old value.
+
+    Anything ambiguous (unbraced body, loop, switch, goto, missing jump map)
+    is left to the existing conservative liveness guard.
+    """
+    metadata = getattr(func, 'metadata', None)
+    if not (isinstance(metadata, dict)
+            and metadata.get('jump_target_metadata_available') is True):
+        return set()
+
+    depth = 0
+    for obj in func.code[:end_index + 1]:
+        if not obj.visible or not obj.decompiled:
+            continue
+        text = obj.decompiled.strip()
+        if text == '{':
+            depth += 1
+        elif text == '}':
+            depth -= 1
+    base_depth = depth
+    if base_depth < 0:
+        return set()
+
+    last_target = max((i for i in range(end_index + 1, len(func.code))
+                       if func.code[i].visible and
+                       (func.code[i].get_metadata('is_jump_target') is True or
+                        (func.code[i].get_metadata('incoming_jump_count') or 0) > 0)),
+                      default=-1)
+
+    safe_indices = set()
+    pending_unbraced_body = False
+    saw_if = False
+    ambiguous = False
+    for index in range(end_index + 1, len(func.code)):
+        obj = func.code[index]
+        if not obj.visible or not obj.decompiled:
+            continue
+        text = obj.decompiled.strip()
+        if text == '{':
+            depth += 1
+            pending_unbraced_body = False
+            continue
+        if text == '}':
+            depth -= 1
+            pending_unbraced_body = False
+            if depth < 0:
+                ambiguous = True
+            continue
+        if _DICT_COMPLEX_FLOW_RE.match(text):
+            ambiguous = True
+        if _DICT_IF_ELSE_RE.match(text):
+            saw_if = True
+            if '{' in text or '}' in text:
+                ambiguous = True
+            # View8 normally emits a following standalone `{`. If it does
+            # not, the very next statement is conditional at this depth.
+            pending_unbraced_body = True
+            continue
+        if text.startswith('}'):
+            ambiguous = True  # combined `} else {` or other compact syntax
+            continue
+        if pending_unbraced_body:
+            # The preceding if/else has no braces. Never treat this line as
+            # an unconditional kill of the old register value.
+            pending_unbraced_body = False
+            continue
+        if (saw_if and not ambiguous and depth <= base_depth
+                and index >= last_target):
+            match = re.match(r'^\s*(r\d+)\s*=(?!=)', text)
+            if match:
+                safe_indices.add(index)
+    return safe_indices
+
+
+def _has_remaining_dict_references(func, end_index, reg, alias,
+                                   dead_copy_indices=None):
+    """Detect remaining visible uses of a local dictionary or its aliases.
+
+    A trailing dead register copy such as ``r6 = r1`` must not keep the
+    dictionary alive when r6 is never read.  Such copies can be hidden
+    together with dictionary definitions, but a live copy or a computed
+    dictionary access still prevents hiding.
     """
     live = {reg, alias}
     across_control_flow = False
+    safe_postbranch_rebindings = None
+    dead_copies = []
 
-    for obj in func.code[end_index + 1:]:
+    for index in range(end_index + 1, len(func.code)):
+        obj = func.code[index]
         if not obj.visible or not obj.decompiled:
             continue
         line = _DICT_LITERAL_RE.sub('""', obj.decompiled)
@@ -306,18 +424,38 @@ def _has_remaining_dict_references(func, end_index, reg, alias):
             continue
 
         lhs, rhs = line[:assign_i].strip(), line[assign_i + 1:]
-        if live.intersection(_DICT_REGISTER_RE.findall(rhs)):
+        rhs_live = live.intersection(_DICT_REGISTER_RE.findall(rhs))
+        if rhs_live:
+            # A plain register copy whose destination is never subsequently
+            # read has no observable effect.  Ignore it for dictionary
+            # liveness, and hide it if the dictionary itself is removed.
+            if (re.fullmatch(r'r\d+', lhs)
+                    and re.fullmatch(r'r\d+', rhs.strip())
+                    and lhs not in live
+                    and _is_unread_register_copy_target(func, index, lhs)):
+                dead_copies.append(index)
+                continue
             return True
+
         if re.fullmatch(r'r\d+', lhs):
-            # A write in a branch may not execute. Only retire aliases in
-            # regions that are demonstrably straight-line in this listing.
+            # A write on a branch might not execute.  Only retire aliases
+            # when the remaining listing is demonstrably straight-line.
             if not across_control_flow:
                 live.discard(lhs)
+            else:
+                if safe_postbranch_rebindings is None:
+                    safe_postbranch_rebindings = _unconditional_rebindings_after_branches(
+                        func, end_index
+                    )
+                if index in safe_postbranch_rebindings:
+                    live.discard(lhs)
             if not live:
-                return False
+                break
         elif live.intersection(_DICT_REGISTER_RE.findall(lhs)):
-            return True  # includes rN[computed] = value
+            return True
 
+    if dead_copy_indices is not None:
+        dead_copy_indices.extend(dead_copies)
     return False
 
 
@@ -390,11 +528,12 @@ def _propagate_local_dict_in_func(func, start_index, verbosity):
     # the dictionary. Keep its definitions whenever a consumer remains.
     # An incomplete dictionary can still be removed if none of its remaining
     # visible consumers require it (e.g. obsolete CFF bookkeeping entries).
+    dead_copy_indices = []
     if not missing_keys and not _has_remaining_dict_references(
-        func, end_index, reg, regTo
+        func, end_index, reg, regTo, dead_copy_indices
     ):
-        defLineIndx.append(start_index)
-        defLineIndx.append(end_index)
+        defLineIndx.extend((start_index, end_index))
+        defLineIndx.extend(dead_copy_indices)
         hide_lines(func, defLineIndx)
     if verbosity:
         print("---\n")
