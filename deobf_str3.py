@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from View8.Parser.shared_function_info import load_functions_from_file
 from View8.view8_util import export_to_file
 from deobf_commons import customB64, load_string_array, set_string_metadata, simplify_chain_assignments, save_string_list, hide_safe_unreferenced_constants
-from deobf_scope2 import propagate_variables_default
+from deobf_scope2 import propagate_variables_default, replace_functions_via_registers
 from deobf_str2 import _fold_adjacent_string_literals_in_line
 
 FUNC = r'func_[A-Za-z0-9_$]+_0x[0-9a-fA-F]+'
@@ -342,7 +342,28 @@ def _fold_literal_pairs_in_visible_line(obj, verbosity, name):
     if '+' not in raw or not _ADJACENT_LITERAL_OPERATOR.search(raw):
         return 0
     return _fold_adjacent_string_literals_in_line(obj, verbosity, name)
-    
+
+
+def resolve_variant3_indirect_calls(functions, resolved, verbosity=0,
+                                    function_names=None):
+    """Expose indirect calls to known variant-3 wrappers before decoding.
+
+    Reuse View8's existing register-function alias pass, restricted to the
+    discovered decoder tree. The normal string propagation and literal
+    consolidation can then resolve computed property names before the
+    local-dictionary pass runs. No generic operator aliases are modified.
+    """
+    if function_names is None:
+        selected = functions
+    else:
+        selected = {
+            name: functions[name] for name in function_names
+            if name in functions and getattr(functions[name], 'visible', True)
+        }
+    return replace_functions_via_registers(
+        selected, verbosity, only_functions=set(resolved)
+    )
+
 
 def process_calls(functions, resolved, chunks, verbosity=0, function_names=None):
     """Process only visible functions, ignoring decoder implementations."""
@@ -682,7 +703,10 @@ def strings_deobfuscate_v3(functions, verbosity=0, strfunc=None, deobf_root=None
         return False
     _STATE = (resolved, chunks)
     _GRAPH = graph
+    aliases = resolve_variant3_indirect_calls(functions, resolved, verbosity)
     stats = process_calls(functions, resolved, chunks, verbosity)
+    if aliases:
+        stats['indirect_decoder_functions'] += aliases
     # Like variant 2, clean unused index/string temporaries in the filter
     # itself.  Standalone and deobf_all.py calls now share this behavior.
     cleanup = cleanup_variant3_dead_assignments(functions)
@@ -706,7 +730,12 @@ def refresh_deobfuscated_strings_v3(functions, verbosity=0, function_names=None)
     if _STATE is None:
         return False
     resolved, chunks = _STATE
+    aliases = resolve_variant3_indirect_calls(
+        functions, resolved, verbosity, function_names
+    )
     stats = process_calls(functions, resolved, chunks, verbosity, function_names)
+    if aliases:
+        stats['indirect_decoder_functions'] += aliases
     # A refresh can expose new string literals and make their index
     # temporaries dead.  Clean only the functions processed by this refresh.
     cleanup = cleanup_variant3_dead_assignments(functions, function_names)

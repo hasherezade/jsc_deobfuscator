@@ -1146,9 +1146,13 @@ def find_and_process_func(functions, name, replace_local, verbosity):
 
 ###
 
-def _replace_functions_via_registers(func, verbosity):
-    """
-    Replace register-indirect function calls with direct calls.
+def _replace_functions_via_registers(func, verbosity, only_functions=None):
+    """Replace register-indirect calls with direct calls.
+
+    When only_functions is set, limit substitutions to aliases of those
+    callees.  This restricted path is used by the variant-3 string filter;
+    it avoids modifying unrelated indirect calls before the operator pass.
+    The historical (unrestricted) behavior remains unchanged.
     """
 
     patternAssign = r'^(r\d+)\s*='
@@ -1157,7 +1161,15 @@ def _replace_functions_via_registers(func, verbosity):
 
     reg_to_func = {}
     assign_lines = {}
-    hide_assign_lines = True
+    hide_assign_lines = only_functions is None
+    used_alias_definitions = set()
+    # Do not carry a statically known alias between conditional paths when
+    # this early, targeted pass runs before CFG-aware operator processing.
+    barrier = re.compile(
+        r'^(?:[{}]|if\b|else\b|while\b|for\b|switch\b|case\b|'
+        r'default\b|catch\b|finally\b|try\b|do\b|goto\b|'
+        r'CASE_[A-Za-z0-9_]+\s*=|[A-Za-z0-9_$]+\s*:)'
+    ) if only_functions is not None else None
 
     replaced = 0
     i = 0
@@ -1167,6 +1179,9 @@ def _replace_functions_via_registers(func, verbosity):
             break
 
         line = func.code[i].decompiled
+        if barrier and barrier.match(line.strip()):
+            reg_to_func.clear()
+            assign_lines.clear()
         assign_reg = None
         # ----------------------------------------------------
         # Assignment
@@ -1179,11 +1194,12 @@ def _replace_functions_via_registers(func, verbosity):
             if m_def:
                 reg = m_def.group(1)
                 func_name = m_def.group(2)
-                reg_to_func[reg] = func_name
-                assign_lines[reg] = i
-                if verbosity > 1:
-                    print(f"Added: {reg} -> {func_name}")
-                continue
+                if only_functions is None or func_name in only_functions:
+                    reg_to_func[reg] = func_name
+                    assign_lines[reg] = i
+                    if verbosity > 1:
+                        print(f"Added: {reg} -> {func_name}")
+                    continue
 
         # ----------------------------------------------------
         # Replacement loop until stable
@@ -1193,9 +1209,11 @@ def _replace_functions_via_registers(func, verbosity):
             args = m.group(2)
             if reg in reg_to_func and reg_to_func[reg]:
 
+                assign_indx = assign_lines[reg]
                 if hide_assign_lines:
-                    assign_indx = assign_lines[reg]
                     func.code[assign_indx].visible = False
+                else:
+                    used_alias_definitions.add((assign_indx, reg))
 
                 return f"{reg_to_func[reg]}({args})"
             return m.group(0)
@@ -1217,10 +1235,22 @@ def _replace_functions_via_registers(func, verbosity):
         if assign_reg is not None:
             reg_to_func[assign_reg] = None
 
+    # Restricted early resolution hides an alias definition only when no
+    # visible use of that register remains. Keep it if it is also used as a
+    # value, in a property access, or at an unresolved call site.
+    for definition_idx, reg in used_alias_definitions:
+        if any(
+            obj.visible and obj.decompiled and
+            re.search(rf'\b{re.escape(reg)}\b', obj.decompiled)
+            for idx, obj in enumerate(func.code) if idx != definition_idx
+        ):
+            continue
+        func.code[definition_idx].visible = False
+
     return replaced
 
 
-def replace_functions_via_registers(functions, verbosity):
+def replace_functions_via_registers(functions, verbosity, only_functions=None):
     """
     Replace register-indirect function calls with direct calls.
     Example:
@@ -1232,7 +1262,7 @@ def replace_functions_via_registers(functions, verbosity):
     """
     assignments_found = 0
     for func_name, func in functions.items():
-        if _replace_functions_via_registers(func, verbosity):
+        if _replace_functions_via_registers(func, verbosity, only_functions):
             assignments_found += 1
             if verbosity:
                 print(f"[REPLACED IN FUNC] {func_name}")
